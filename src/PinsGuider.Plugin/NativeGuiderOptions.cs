@@ -125,6 +125,10 @@ internal sealed class NativeGuiderOptions
         new("ReacquireTimeoutSec", "Lost star timeout", "Safety", "int", "60", Unit: "s", Min: 10, Max: 600),
         new("MaxPulseDutyPercent", "Max correction duty", "Safety", "int", "50", Unit: "%", Min: 10, Max: 100,
             Description: "Guiding stops when an axis is pulsed more than this share of a minute (runaway protection)."),
+        new("PauseWhenSlewing", "Pause while mount slews", "Safety", "bool", "true",
+            Description: "Pause corrections while the mount reports slewing/parked. Turn off only if the mount driver reports 'slewing' permanently."),
+        new("PauseWhenTrackingOff", "Pause when tracking is off", "Safety", "bool", "true",
+            Description: "Pause corrections while the mount reports tracking off. Turn off if the mount driver cannot report its tracking state."),
         new("SaveGuideLog", "Write guide log", "Safety", "bool", "true", Description: "PHD2-compatible guide log in ~/.local/share/NINA/NativeGuider/Logs."),
     ];
 

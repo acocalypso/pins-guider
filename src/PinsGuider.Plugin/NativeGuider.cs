@@ -189,7 +189,7 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
             camera = indiCamera;
             var cam = indiCamera;
             output = options.UseCameraSt4 ? new CameraSt4PulseOutput(() => cam.DeviceId) : new MountPulseOutput(telescopeMediator);
-            mountState = new NinaMountState(telescopeMediator);
+            mountState = new NinaMountState(telescopeMediator, () => options.GetBool("PauseWhenSlewing"), () => options.GetBool("PauseWhenTrackingOff"));
             if (settings.FocalLengthMm <= 0)
             {
                 Notification.ShowWarning("Native guider: guide focal length is not set — arcsec values and calibration step use defaults. Set FocalLengthMm.");

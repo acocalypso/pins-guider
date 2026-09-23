@@ -12,7 +12,7 @@ using PierSide = PinsGuider.Engine.Core.PierSide;
 namespace PinsGuider.Plugin.Hardware;
 
 /// <summary>Mount state from NINA's telescope mediator.</summary>
-internal sealed class NinaMountState(ITelescopeMediator telescope) : IMountState
+internal sealed class NinaMountState(ITelescopeMediator telescope, Func<bool>? pauseWhenSlewing = null, Func<bool>? pauseWhenTrackingOff = null) : IMountState
 {
     public const double SiderealArcsecPerSec = 15.041;
 
@@ -37,10 +37,10 @@ internal sealed class NinaMountState(ITelescopeMediator telescope) : IMountState
                 NinaPierSide.pierWest => PierSide.West,
                 _ => PierSide.Unknown,
             },
-            IsSlewing = info.Slewing,
-            IsParked = info.AtPark,
+            IsSlewing = info.Slewing && (pauseWhenSlewing?.Invoke() ?? true),
+            IsParked = info.AtPark && (pauseWhenSlewing?.Invoke() ?? true),
             IsHoming = false,
-            IsTracking = info.TrackingEnabled,
+            IsTracking = info.TrackingEnabled || !(pauseWhenTrackingOff?.Invoke() ?? true),
             GuideRateRa = Rate(info.GuideRateRightAscensionArcsecPerSec),
             GuideRateDec = Rate(info.GuideRateDeclinationArcsecPerSec),
         };
