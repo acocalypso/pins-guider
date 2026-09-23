@@ -54,7 +54,7 @@ internal sealed class NativeGuiderOptions
         new("ExposureSeconds", "Exposure", "Camera", "double", "2", Basic: true, Unit: "s", Min: 0.01, Max: 30,
             Phd2Fallback: s => s.PHD2ExposureMs is { } ms && ms > 0 ? (ms / 1000.0).ToString(Inv) : null),
         new("Gain", "Gain", "Camera", "int", "-1", Basic: true, Min: -1, Max: 10000,
-            Description: "-1 keeps the driver's current gain.", Phd2Fallback: s => s.PHD2CameraGain?.ToString(Inv)),
+            Description: "-1 keeps the driver's current gain. (PHD2's gain is a percentage, so it is not carried over.)"),
         new("Offset", "Offset", "Camera", "int", "-1", Min: -1, Max: 10000, Description: "-1 keeps the driver's current offset."),
         new("Binning", "Binning", "Camera", "int", "1", Basic: true, Min: 1, Max: 4, Phd2Fallback: s => s.PHD2CameraBinning?.ToString(Inv)),
         new("FocalLengthMm", "Guide focal length", "Camera", "double", "0", Basic: true, Unit: "mm", Min: 0, Max: 10000,
@@ -134,6 +134,7 @@ internal sealed class NativeGuiderOptions
 
     private readonly IProfileService profileService;
     private readonly Guid pluginId;
+    private readonly object gate = new();
 
     public NativeGuiderOptions(IProfileService profileService, Guid pluginId)
     {
@@ -146,6 +147,14 @@ internal sealed class NativeGuiderOptions
     private PluginOptionsAccessor Accessor => new(profileService, pluginId);
 
     public string GetString(string name)
+    {
+        lock (gate)
+        {
+            return GetStringCore(name);
+        }
+    }
+
+    private string GetStringCore(string name)
     {
         var def = Find(name) ?? throw new ArgumentException($"unknown setting {name}", nameof(name));
         string? stored = null;
@@ -199,7 +208,11 @@ internal sealed class NativeGuiderOptions
             return false;
         }
 
-        Accessor.SetValueString(def.Name, normalized);
+        lock (gate)
+        {
+            Accessor.SetValueString(def.Name, normalized);
+        }
+
         return true;
     }
 

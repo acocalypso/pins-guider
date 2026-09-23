@@ -63,6 +63,8 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
     private ICameraSource? cameraSource;
     private string darkLibrary = string.Empty;
     private volatile bool buildingDarks;
+    private volatile bool pauseWhenSlewing = true;
+    private volatile bool pauseWhenTrackingOff = true;
 
     public NativeGuider(IProfileService profileService, ITelescopeMediator telescopeMediator, ICameraMediator cameraMediator, Guid pluginId)
     {
@@ -166,6 +168,7 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
 
     private async Task ConnectCoreAsync(CancellationToken ct)
     {
+        RefreshCachedOptions();
         var settings = options.ToEngineSettings();
         ICameraSource camera;
         IPulseOutput output;
@@ -189,7 +192,7 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
             camera = indiCamera;
             var cam = indiCamera;
             output = options.UseCameraSt4 ? new CameraSt4PulseOutput(() => cam.DeviceId) : new MountPulseOutput(telescopeMediator);
-            mountState = new NinaMountState(telescopeMediator, () => options.GetBool("PauseWhenSlewing"), () => options.GetBool("PauseWhenTrackingOff"));
+            mountState = new NinaMountState(telescopeMediator, () => pauseWhenSlewing, () => pauseWhenTrackingOff, mountOptional: options.UseCameraSt4);
             if (settings.FocalLengthMm <= 0)
             {
                 Notification.ShowWarning("Native guider: guide focal length is not set — arcsec values and calibration step use defaults. Set FocalLengthMm.");
@@ -279,7 +282,7 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
     public async Task<bool> AutoSelectGuideStar()
     {
         var g = guider;
-        if (g is null)
+        if (g is null || g.State.IsGuidingActive() || g.State == GuiderState.Calibrating)
         {
             return false;
         }
@@ -327,6 +330,23 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
                 Notification.ShowError("Native guider: the mount driver does not support pulse guiding (use the camera ST4 guide output instead)");
                 return false;
             }
+        }
+
+        if (!forceCalibration && g.State == GuiderState.Guiding)
+        {
+            // PHD2 parity: already guiding → nothing to do (NINA's Restore Guiding calls this before every frame)
+            return true;
+        }
+
+        if (!forceCalibration && g.State == GuiderState.Calibrating)
+        {
+            // a calibration is running (e.g. started from the UI): wait for it instead of restarting
+            while (g.State == GuiderState.Calibrating)
+            {
+                await Task.Delay(500, ct).ConfigureAwait(false);
+            }
+
+            return g.State == GuiderState.Guiding;
         }
 
         this.progress = progress;
@@ -519,6 +539,13 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
 
     public bool TrySetSetting(string name, string value, out string error)
     {
+        if (guider is { } running && (running.State.IsGuidingActive() || running.State == GuiderState.Calibrating || buildingDarks)
+            && string.Equals(name, "Binning", StringComparison.OrdinalIgnoreCase))
+        {
+            error = "Stop guiding before changing the binning";
+            return false;
+        }
+
         if (!options.TrySet(name, value, out error))
         {
             return false;
@@ -680,7 +707,7 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
 
         try
         {
-            var loaded = DarkLibraryFiles.Load(cam.Name, cam.SensorWidth, cam.SensorHeight, g.Settings.Binning);
+            var loaded = DarkLibraryFiles.Load(cam.Name, cam.SensorWidth, cam.SensorHeight, Math.Max(1, options.GetInt("Binning")));
             g.Preprocessor.Darks = loaded?.Library;
             darkLibrary = loaded is { } l ? $"{Path.GetFileName(l.Source)} ({l.Library.Count} darks)" : string.Empty;
             if (loaded is null)
@@ -751,8 +778,15 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
         }
     }
 
+    private void RefreshCachedOptions()
+    {
+        pauseWhenSlewing = options.GetBool("PauseWhenSlewing");
+        pauseWhenTrackingOff = options.GetBool("PauseWhenTrackingOff");
+    }
+
     private void ApplySettingsIfConnected()
     {
+        RefreshCachedOptions();
         var g = guider;
         if (g is null)
         {
@@ -1073,7 +1107,14 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
         try
         {
             var info = cameraMediator.GetInfo();
-            return info is { Connected: true } ? info.DeviceId : null;
+            if (info is { Connected: true } && !string.IsNullOrEmpty(info.DeviceId))
+            {
+                return info.DeviceId;
+            }
+
+            // not connected yet: the profile remembers the selected main camera
+            var id = profileService.ActiveProfile.CameraSettings.Id;
+            return string.IsNullOrEmpty(id) || id == "No_Device" ? null : id;
         }
         catch
         {
@@ -1113,7 +1154,9 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
         var g = guider;
         string profileId = profileService.ActiveProfile.Id.ToString();
         string cameraName = indiCamera?.Name ?? (simulator is not null ? "Simulator" : options.GuideCameraDevice);
-        string mountName = simulator is not null ? "Simulator" : options.UseCameraSt4 ? "ST4" : telescopeMediator.GetInfo()?.Name ?? "Mount";
+        string mountName = simulator is not null ? "Simulator"
+            : options.UseCameraSt4 ? "ST4"
+            : profileService.ActiveProfile.TelescopeSettings.Id is { Length: > 0 } tid && tid != "No_Device" ? tid : "Mount";
         if (string.IsNullOrEmpty(cameraName))
         {
             return null;

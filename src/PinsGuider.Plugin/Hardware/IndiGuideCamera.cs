@@ -82,9 +82,12 @@ internal sealed class IndiGuideCamera : ICameraSource, IDisposable
         var candidates = devices.Where(d => string.Equals(d.Driver, driver, StringComparison.OrdinalIgnoreCase)).ToList();
         if (candidates.Count == 0)
         {
-            // some drivers report DRIVER_EXEC differently; fall back to all CCD devices
-            candidates = devices.ToList();
+            // drivers that don't publish DRIVER_EXEC
+            candidates = devices.Where(d => string.IsNullOrEmpty(d.Driver)).ToList();
         }
+
+        string? main = mainCameraName();
+        string available = string.Join(", ", candidates.Select(d => d.Id));
 
         INDIDeviceInfo? chosen;
         if (!string.IsNullOrWhiteSpace(requestedDevice))
@@ -94,18 +97,31 @@ internal sealed class IndiGuideCamera : ICameraSource, IDisposable
             if (chosen is null)
             {
                 throw new GuideCameraException(
-                    $"Guide camera '{requestedDevice}' not found for driver {driver}. Available: {string.Join(", ", candidates.Select(d => d.Id))}");
+                    $"Guide camera '{requestedDevice}' not found for driver {driver}. Available: {(available.Length > 0 ? available : "none")}");
             }
         }
         else
         {
-            string? main = mainCameraName();
-            chosen = candidates.FirstOrDefault(d => main is null || !string.Equals(d.Id, main, StringComparison.OrdinalIgnoreCase))
-                ?? candidates.FirstOrDefault();
-            if (chosen is null)
+            // never pick the main imaging camera; with several possible cameras, ask the user to choose
+            var others = candidates.Where(d => main is null || !string.Equals(d.Id, main, StringComparison.OrdinalIgnoreCase)).ToList();
+            if (others.Count == 0)
             {
-                throw new GuideCameraException($"No INDI camera found for driver {driver}. Is the guide camera plugged in and powered?");
+                throw new GuideCameraException(candidates.Count == 0
+                    ? $"No INDI camera found for driver {driver}. Is the guide camera plugged in and powered?"
+                    : $"Driver {driver} only offers the main imaging camera ({available}). Set the guide camera driver/device.");
             }
+
+            if (others.Count > 1)
+            {
+                throw new GuideCameraException($"Several cameras found for {driver} ({string.Join(", ", others.Select(d => d.Id))}). Set GuideCameraDevice to the guide camera.");
+            }
+
+            chosen = others[0];
+        }
+
+        if (main is not null && string.Equals(chosen.Id, main, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new GuideCameraException($"'{chosen.Id}' is the main imaging camera; choose a different guide camera.");
         }
 
         info = chosen;

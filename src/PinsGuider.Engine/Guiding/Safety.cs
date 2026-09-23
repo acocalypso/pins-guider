@@ -33,8 +33,11 @@ public sealed record SafetySettings
     /// <summary>Observed move below this fraction of the expected move counts as "no response".</summary>
     public double NotRespondingFraction { get; init; } = 0.25;
 
-    /// <summary>Lost-star reacquire timeout before guiding fails.</summary>
+    /// <summary>Lost-star reacquire timeout: a critical alert is raised, then (see <see cref="StopOnLostStarTimeout"/>) guiding stops or keeps searching.</summary>
     public double ReacquireTimeoutSec { get; init; } = 60;
+
+    /// <summary>Stop guiding (Failed) at the lost-star timeout. Default false: keep searching like PHD2 and resume when the star returns.</summary>
+    public bool StopOnLostStarTimeout { get; init; }
 
     /// <summary>Seconds of searching near the last position before full-frame searches start.</summary>
     public double ReacquireLocalSearchSec { get; init; } = 10;

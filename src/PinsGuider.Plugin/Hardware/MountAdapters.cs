@@ -12,7 +12,8 @@ using PierSide = PinsGuider.Engine.Core.PierSide;
 namespace PinsGuider.Plugin.Hardware;
 
 /// <summary>Mount state from NINA's telescope mediator.</summary>
-internal sealed class NinaMountState(ITelescopeMediator telescope, Func<bool>? pauseWhenSlewing = null, Func<bool>? pauseWhenTrackingOff = null) : IMountState
+internal sealed class NinaMountState(ITelescopeMediator telescope, Func<bool>? pauseWhenSlewing = null, Func<bool>? pauseWhenTrackingOff = null,
+    bool mountOptional = false) : IMountState
 {
     public const double SiderealArcsecPerSec = 15.041;
 
@@ -21,7 +22,10 @@ internal sealed class NinaMountState(ITelescopeMediator telescope, Func<bool>? p
         var info = telescope.GetInfo();
         if (info is null || !info.Connected)
         {
-            return new MountSnapshot { IsConnected = false };
+            // ST4 guiding works without a mount connection; pier side/declination are then unknown
+            return mountOptional
+                ? new MountSnapshot { IsConnected = true, IsTracking = true, PierSide = PierSide.Unknown }
+                : new MountSnapshot { IsConnected = false };
         }
 
         static double? Rate(double arcsecPerSec) => double.IsNaN(arcsecPerSec) || arcsecPerSec <= 0 ? null : arcsecPerSec / SiderealArcsecPerSec;
@@ -38,7 +42,7 @@ internal sealed class NinaMountState(ITelescopeMediator telescope, Func<bool>? p
                 _ => PierSide.Unknown,
             },
             IsSlewing = info.Slewing && (pauseWhenSlewing?.Invoke() ?? true),
-            IsParked = info.AtPark && (pauseWhenSlewing?.Invoke() ?? true),
+            IsParked = info.AtPark,
             IsHoming = false,
             IsTracking = info.TrackingEnabled || !(pauseWhenTrackingOff?.Invoke() ?? true),
             GuideRateRa = Rate(info.GuideRateRightAscensionArcsecPerSec),

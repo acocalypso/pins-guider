@@ -79,6 +79,12 @@ public sealed class Guider : IAsyncDisposable
     private bool fullPause;
     private bool autoPaused;
     private bool needsRestartAfterMove;
+    private bool userPaused;
+    private bool lostTimeoutAlerted;
+    private DateTimeOffset? flipTime;
+    private bool flipInverted;
+    private bool deferEvents;
+    private readonly List<GuiderEvent> deferredEvents = [];
     private DecGuideMode? savedDecGuideMode;
     private int pulseFailures;
     private double lastGoodMass;
@@ -170,6 +176,7 @@ public sealed class Guider : IAsyncDisposable
         {
             if (state is GuiderState.Stopped or GuiderState.Failed)
             {
+                ClearRequests();
                 SetState(GuiderState.Looping);
             }
         });
@@ -212,6 +219,12 @@ public sealed class Guider : IAsyncDisposable
     {
         Post(() =>
         {
+            if (state.IsGuidingActive() || state == GuiderState.Calibrating)
+            {
+                // the guide star cannot be changed while guiding
+                return;
+            }
+
             autoSelectRequested = true;
             autoSelectAttemptsLeft = Math.Max(1, settings.AutoSelectAttempts);
             if (state is GuiderState.Stopped or GuiderState.Failed)
@@ -240,9 +253,15 @@ public sealed class Guider : IAsyncDisposable
             }
 
             ReplacePending(op);
+            if (state.IsGuidingActive() || state == GuiderState.Calibrating)
+            {
+                // restart (forced recalibration, or resume from pause/lost star): stop the current run first
+                StopRunCore();
+            }
+
             this.forceCalibration = forceCalibration;
             startGuidingRequested = true;
-            if (state is GuiderState.Stopped or GuiderState.Failed or GuiderState.Paused)
+            if (state is GuiderState.Stopped or GuiderState.Failed or GuiderState.Paused or GuiderState.Selected)
             {
                 ResetGuidingRuntime();
                 SetState(GuiderState.Looping);
@@ -283,6 +302,7 @@ public sealed class Guider : IAsyncDisposable
         }
 
         fullPause = full;
+        userPaused = true;
         if (state != GuiderState.Paused)
         {
             corrector.GuidingPaused();
@@ -295,6 +315,7 @@ public sealed class Guider : IAsyncDisposable
     public void Resume() => Post(() =>
     {
         fullPause = false;
+        userPaused = false;
         if (needsRestartAfterMove)
         {
             // the mount moved far while paused: select a new star and lock on it without recalibrating
@@ -316,9 +337,35 @@ public sealed class Guider : IAsyncDisposable
         }
     });
 
+    /// <summary>Clears pending start/select requests (stale requests must never start calibration later).</summary>
+    private void ClearRequests()
+    {
+        startGuidingRequested = false;
+        autoSelectRequested = false;
+        forceCalibration = false;
+    }
+
+    /// <summary>Stops the current guiding/calibration run (without touching the pending operation) so it can be restarted.</summary>
+    private void StopRunCore()
+    {
+        corrector.GuidingStopped();
+        settle.Cancel();
+        recenter.Cancel();
+        calibrationProcess = null;
+        fullPause = false;
+        userPaused = false;
+        Emit(new GuidingStoppedEvent(clock.UtcNow));
+        SetState(tracker.IsLocked ? GuiderState.Selected : GuiderState.Looping);
+    }
+
     /// <summary>Forget the calibration (PHD2 clear_calibration).</summary>
     public void ClearCalibration() => Post(() =>
     {
+        if (state.IsGuidingActive() || state == GuiderState.Calibrating)
+        {
+            StopGuidingCore(GuiderState.Selected);
+        }
+
         calibration = null;
         adjustment = null;
         transform = null;
@@ -328,6 +375,12 @@ public sealed class Guider : IAsyncDisposable
     /// <summary>Use a stored calibration (e.g. from <see cref="CalibrationStore"/>); it is adjusted for the current pointing when guiding starts.</summary>
     public void LoadCalibration(CalibrationData data) => Post(() =>
     {
+        if (state.IsGuidingActive() || state == GuiderState.Calibrating)
+        {
+            // applied on the next start; never swap the calibration under a running guide loop
+            return;
+        }
+
         calibration = data;
         adjustment = null;
         transform = null;
@@ -382,7 +435,17 @@ public sealed class Guider : IAsyncDisposable
             loopCts?.Dispose();
             loopCts = externalToken.CanBeCanceled ? CancellationTokenSource.CreateLinkedTokenSource(externalToken) : new CancellationTokenSource();
             var ct = loopCts.Token;
-            loopTask = Task.Run(() => LoopAsync(ct), CancellationToken.None);
+            var task = Task.Run(() => LoopAsync(ct), CancellationToken.None);
+            loopTask = task;
+
+            // commands posted while the loop was finishing would otherwise wait for the next start
+            task.ContinueWith(_ =>
+            {
+                if (!commands.IsEmpty && AutoStartLoop)
+                {
+                    EnsureLoop();
+                }
+            }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
         }
     }
 
@@ -482,7 +545,9 @@ public sealed class Guider : IAsyncDisposable
             settle.Cancel();
             recenter.Cancel();
             calibrationProcess = null;
+            ClearRequests();
             CompletePending(SettleResult.Failed(state == GuiderState.Failed ? lastError?.Code ?? GuideErrorCode.Internal : GuideErrorCode.None, "guiding stopped"));
+            FlushEvents();
             Emit(new LoopingExposuresStoppedEvent(clock.UtcNow));
         }
     }
@@ -530,6 +595,21 @@ public sealed class Guider : IAsyncDisposable
 
     private async Task ProcessFrameAsync(GuideFrame frame, MountSnapshot snapshot, Stopwatch sw, CancellationToken ct)
     {
+        // events are delivered after the correction went out so subscribers (logs, UIs) never delay pulses
+        deferEvents = true;
+        try
+        {
+            await ProcessFrameCoreAsync(frame, snapshot, sw, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            deferEvents = false;
+            FlushEvents();
+        }
+    }
+
+    private async Task ProcessFrameCoreAsync(GuideFrame frame, MountSnapshot snapshot, Stopwatch sw, CancellationToken ct)
+    {
         var now = clock.UtcNow;
         MultiStarFrameResult? result = null;
         IReadOnlyList<PulseCommand> pulses = [];
@@ -565,6 +645,12 @@ public sealed class Guider : IAsyncDisposable
 
         if (pulses.Count > 0 && state.IsCapturing())
         {
+            // the snapshot was taken before the exposure: never pulse a mount that started slewing/parked meanwhile
+            if (MountStateWatcher.Evaluate(SafeSnapshot()) != MountPauseReason.None)
+            {
+                return;
+            }
+
             await IssuePulsesAsync(pulses, ct).ConfigureAwait(false);
         }
     }
@@ -768,6 +854,7 @@ public sealed class Guider : IAsyncDisposable
     private void FailCalibration(GuideErrorCode code, string? reason, DateTimeOffset now)
     {
         calibrationProcess = null;
+        ClearRequests();
         Alert(code, reason);
         Emit(new CalibrationFailedEvent(now, MountName, reason ?? GuideErrorCatalog.Get(code).Title, code));
         SetState(tracker.IsLocked ? GuiderState.Selected : GuiderState.Looping);
@@ -825,6 +912,7 @@ public sealed class Guider : IAsyncDisposable
 
     private void EnterGuiding(GuidePoint starPosition, CalibrationAdjustment adj, DateTimeOffset now)
     {
+        ClearRequests();
         UseCalibration(adj);
         ResetGuidingRuntime();
         corrector.GuidingStarted();
@@ -839,6 +927,8 @@ public sealed class Guider : IAsyncDisposable
         if (adj.Flipped && settings.VerifyDecAfterFlip && settings.DecGuideMode != DecGuideMode.Off)
         {
             decFlip.Start();
+            flipTime = now;
+            flipInverted = false;
         }
 
         if (pending is { Kind: PendingKind.Guide } p)
@@ -856,6 +946,10 @@ public sealed class Guider : IAsyncDisposable
         decFlip.Reset();
         pulseFailures = 0;
         autoPaused = false;
+        userPaused = false;
+        needsRestartAfterMove = false;
+        lostTimeoutAlerted = false;
+        mountWatch.ClearExplicitResume();
         tracker.Distances.NeedReset = true;
     }
 
@@ -870,7 +964,12 @@ public sealed class Guider : IAsyncDisposable
         bool raOnly = corrector.DecGuideMode == DecGuideMode.Off;
         var ts = new TrackerState(IsGuiding: true, IsSettling: settle.IsActive, IsPaused: paused, RaOnly: raOnly, GuidingEnabled: !paused);
         var r = tracker.ProcessFrame(frame, lockPosition, ts, now);
-        var t = transform!;
+        if (transform is not { } t)
+        {
+            Fail(GuideErrorCode.NotCalibrated, "no calibration while guiding");
+            return r;
+        }
+
         GuideCorrection? corr = null;
         bool recenterMove = false;
 
@@ -931,6 +1030,14 @@ public sealed class Guider : IAsyncDisposable
                 }
 
                 var corrPulses = corr.Pulses.Where(p => p.DurationMs > 0).ToList();
+                if (recenterMove)
+                {
+                    // recovery moves bypass the algorithms and the limiter: never exceed the max pulse
+                    corrPulses = corrPulses.Select(p => p with
+                    {
+                        DurationMs = Math.Min(p.DurationMs, p.Direction.Axis() == GuideAxis.Ra ? settings.MaxRaDurationMs : settings.MaxDecDurationMs),
+                    }).ToList();
+                }
 
                 if (decFlip.IsActive)
                 {
@@ -949,19 +1056,25 @@ public sealed class Guider : IAsyncDisposable
                     int raMs = SignedMs(corr.RADuration, corr.RADirection);
                     int decMs = decObserved ? 0 : SignedMs(corr.DECDuration, corr.DECDirection);
                     var verdict = runaway.Record(now, mountOfs.X, raMs, decObserved ? 0 : mountOfs.Y, decMs, out var axis);
-                    if (verdict == SafetyVerdict.Runaway)
+                    if (verdict == SafetyVerdict.Runaway && axis == GuideAxis.Dec && flipTime is { } ft && (now - ft).TotalMinutes < 15 && !flipInverted
+                        && settings.VerifyDecAfterFlip)
+                    {
+                        // shortly after a meridian flip a Dec runaway is almost certainly a wrong Dec-flip setting:
+                        // invert Dec once instead of stopping; a second runaway stops guiding
+                        InvertDecAfterFlip(now);
+                        corrPulses.RemoveAll(p => p.Direction.Axis() == GuideAxis.Dec);
+                        runaway.Reset();
+                    }
+                    else if (verdict == SafetyVerdict.Runaway)
                     {
                         Fail(GuideErrorCode.RunawayDetected, $"{axis} axis");
                         return r;
                     }
 
+                    // judged on RA only: Dec pulses may legitimately be absorbed by backlash after a reversal
                     if (corr.RADuration > 0)
                     {
                         response.PulseIssued(GuideAxis.Ra, mountOfs.X, -corr.RaCorrectionPx);
-                    }
-                    else if (corr.DECDuration > 0 && !decObserved)
-                    {
-                        response.PulseIssued(GuideAxis.Dec, mountOfs.Y, -corr.DecCorrectionPx);
                     }
                     else
                     {
@@ -1042,6 +1155,13 @@ public sealed class Guider : IAsyncDisposable
             tracker.Distances.CurrentError(false, now.ToUnixTimeMilliseconds()), (int)r.ErrorCode, r.Status));
         stats.AddStarLost(now);
 
+        if (paused)
+        {
+            // paused (by the user or because the mount moves): no reacquire timer, no corrections
+            reacquire.Reset();
+            return;
+        }
+
         if (!reacquire.IsActive)
         {
             reacquire.StarLost(now, lastGoodMass, lastGoodSnr);
@@ -1069,7 +1189,25 @@ public sealed class Guider : IAsyncDisposable
         {
             case ReacquireAction.GiveUp:
                 pulses = [];
-                Fail(GuideErrorCode.StarReacquireTimeout);
+                if (settings.Safety.StopOnLostStarTimeout)
+                {
+                    Fail(GuideErrorCode.StarReacquireTimeout);
+                    break;
+                }
+
+                // Deviation from the v1 design (reviewed): like PHD2, keep searching after the timeout so guiding recovers
+                // by itself when the clouds pass; the timeout raises a critical alert once.
+                if (!lostTimeoutAlerted)
+                {
+                    lostTimeoutAlerted = true;
+                    Alert(GuideErrorCode.StarReacquireTimeout, "still searching");
+                }
+
+                if (frame.FrameNumber % 2 == 0)
+                {
+                    TryReacquireFullFrame(frame);
+                }
+
                 break;
             case ReacquireAction.SearchFullFrame:
                 TryReacquireFullFrame(frame);
@@ -1087,9 +1225,19 @@ public sealed class Guider : IAsyncDisposable
             return;
         }
 
-        // prefer the candidate closest to where the star was last seen
+        // only accept a candidate near where the star was last seen: a different star elsewhere in the frame
+        // would make the guider drive the mount towards the old lock position
         var anchor = lastStarPosition.IsValid ? lastStarPosition : lockPosition;
-        var best = candidates.OrderBy(s => anchor.IsValid ? s.Position.Distance(anchor) : 0).First();
+        double maxDistance = 3.0 * tracker.SearchRegion;
+        var best = candidates
+            .Where(s => !anchor.IsValid || s.Position.Distance(anchor) <= maxDistance)
+            .OrderBy(s => anchor.IsValid ? s.Position.Distance(anchor) : 0)
+            .FirstOrDefault();
+        if (best is null)
+        {
+            return;
+        }
+
         var ordered = new List<GuideStar> { best };
         ordered.AddRange(found.Where(s => !ReferenceEquals(s, best)));
         tracker.Initialize(frame, ordered, best.Position);
@@ -1106,6 +1254,7 @@ public sealed class Guider : IAsyncDisposable
         settings = settings with { DecFlipRequired = !settings.DecFlipRequired };
         UseCalibration(adjustment with { Calibration = inverted });
         decFlip.Reset();
+        flipInverted = true;
         corrector.DecAlgorithm.Reset();
         Alert(GuideErrorCode.DecFlipCorrected);
         Emit(new CalibrationUpdatedEvent(now, inverted, settings.DecFlipRequired));
@@ -1210,6 +1359,10 @@ public sealed class Guider : IAsyncDisposable
             CompletePending(SettleResult.Failed(GuideErrorCode.None, "guiding stopped"));
             SetState(tracker.IsLocked ? next : GuiderState.Looping);
         }
+
+        ClearRequests();
+        fullPause = false;
+        userPaused = false;
     }
 
     private void ResumeCore()
@@ -1226,6 +1379,8 @@ public sealed class Guider : IAsyncDisposable
                 if (adj.Flipped && settings.VerifyDecAfterFlip && settings.DecGuideMode != DecGuideMode.Off)
                 {
                     decFlip.Start();
+                    flipTime = now;
+                    flipInverted = false;
                 }
             }
         }
@@ -1280,6 +1435,12 @@ public sealed class Guider : IAsyncDisposable
             }
 
             autoPaused = false;
+            if (userPaused)
+            {
+                // the user paused before/while the mount moved: stay paused until they resume
+                return;
+            }
+
             ResumeCore();
         }
     }
@@ -1349,8 +1510,9 @@ public sealed class Guider : IAsyncDisposable
         limiter.SetMaxRaDuration(s.MaxRaDurationMs);
         limiter.SetMaxDecDuration(s.MaxDecDurationMs);
         var backlash = new BacklashCompensation(s.Backlash.PulseMs, s.Backlash.FloorMs, s.Backlash.CeilingMs, s.Backlash.Enabled, limiter);
-        bool keepAlgorithms = corrector.RaAlgorithm.Name == ra.Name && corrector.DecAlgorithm.Name == dec.Name &&
-            old.RaAlgorithm == s.RaAlgorithm && old.DecAlgorithm == s.DecAlgorithm && old.MinMovePx == s.MinMovePx;
+        bool keepAlgorithms = !ReferenceEquals(old, s) && corrector.RaAlgorithm.Name == ra.Name && corrector.DecAlgorithm.Name == dec.Name &&
+            SameAlgorithm(old.RaAlgorithm, s.RaAlgorithm) && SameAlgorithm(old.DecAlgorithm, s.DecAlgorithm) && old.MinMovePx == s.MinMovePx &&
+            MinMove.SmartDefault(old.PixelScale(camera.PixelSizeUm)) == MinMove.SmartDefault(pixelScale);
         var newCorrector = new AxisCorrector(keepAlgorithms ? corrector.RaAlgorithm : ra, keepAlgorithms ? corrector.DecAlgorithm : dec, limiter, backlash)
         {
             DecGuideMode = s.DecGuideMode,
@@ -1369,7 +1531,8 @@ public sealed class Guider : IAsyncDisposable
             stats.PixelScale = pixelScale;
         }
 
-        if (!ReferenceEquals(old.Safety, s.Safety) || ReferenceEquals(old, s))
+        // records compare by value: only a real change of the safety settings rebuilds the monitors (and loses their state)
+        if (!Equals(old.Safety, s.Safety) || ReferenceEquals(old, s))
         {
             runaway = new RunawayDetector(s.Safety);
             response = new MountResponseMonitor(s.Safety);
@@ -1377,6 +1540,18 @@ public sealed class Guider : IAsyncDisposable
             cameraRetry = new CameraRetryPolicy(s.Safety);
             reacquire = new ReacquirePolicy(s.Safety);
         }
+    }
+
+    private static bool SameAlgorithm(AlgorithmSettings a, AlgorithmSettings b)
+    {
+        if (a.Kind != b.Kind)
+        {
+            return false;
+        }
+
+        var pa = a.Parameters ?? new Dictionary<string, double>();
+        var pb = b.Parameters ?? new Dictionary<string, double>();
+        return pa.Count == pb.Count && pa.All(kv => pb.TryGetValue(kv.Key, out var v) && v == kv.Value);
     }
 
     private static IGuideAlgorithm CreateAlgorithm(AlgorithmSettings a, GuideAxis axis, double minMove)
@@ -1442,6 +1617,9 @@ public sealed class Guider : IAsyncDisposable
         settle.Cancel();
         recenter.Cancel();
         calibrationProcess = null;
+        ClearRequests();
+        fullPause = false;
+        userPaused = false;
         SetState(GuiderState.Failed);
         CompletePending(SettleResult.Failed(code, detail));
     }
@@ -1460,6 +1638,32 @@ public sealed class Guider : IAsyncDisposable
     }
 
     private void Emit(GuiderEvent e)
+    {
+        if (deferEvents)
+        {
+            deferredEvents.Add(e);
+            return;
+        }
+
+        Deliver(e);
+    }
+
+    private void FlushEvents()
+    {
+        if (deferredEvents.Count == 0)
+        {
+            return;
+        }
+
+        var events = deferredEvents.ToArray();
+        deferredEvents.Clear();
+        foreach (var e in events)
+        {
+            Deliver(e);
+        }
+    }
+
+    private void Deliver(GuiderEvent e)
     {
         try
         {

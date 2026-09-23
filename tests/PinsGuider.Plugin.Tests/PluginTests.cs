@@ -204,7 +204,7 @@ public class NativeGuiderOptionsTests
         var s = o.ToEngineSettings();
         s.FocalLengthMm.Should().Be(248);
         s.ExposureMs.Should().Be(1500);
-        s.Gain.Should().Be(48);
+        s.Gain.Should().BeNull("PHD2 gain is a percentage and is not carried over");
         s.RaAlgorithm.Kind.Should().Be(GuideAlgorithmKind.Lowpass2);
         s.RaAlgorithm.Parameters!["aggressiveness"].Should().Be(65);
         s.DecGuideMode.Should().Be(DecGuideMode.North);

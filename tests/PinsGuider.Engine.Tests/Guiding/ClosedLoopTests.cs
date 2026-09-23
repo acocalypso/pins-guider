@@ -109,7 +109,7 @@ public class ClosedLoopTests
         {
             Sky = SimulatorScenario.GoodMount.Sky with { Transparency = [new TransparencyWindow(300, 500, 0.0, 2.0)] },
         };
-        var h = new Harness(scenario);
+        var h = new Harness(scenario, s => s with { Safety = s.Safety with { StopOnLostStarTimeout = true } });
         _ = h.Guider.StartGuidingAsync(Settle);
         await h.RunFor(TimeSpan.FromMinutes(10));
 
@@ -280,6 +280,16 @@ public class ClosedLoopTests
         await h.RunFor(TimeSpan.FromMinutes(20));
 
         second.Should().NotBeNull();
+        foreach (var a in h.Events.OfType<AlertEvent>())
+        {
+            TestContext.Out.WriteLine($"{h.Seconds(a.Timestamp):F0}s {a.Code} {a.Detail}");
+        }
+
+        foreach (var st in h.Events.OfType<AppStateEvent>())
+        {
+            TestContext.Out.WriteLine($"{h.Seconds(st.Timestamp):F0}s state {st.Previous} -> {st.State}");
+        }
+
         (await second!).Success.Should().BeTrue();
         h.Events.OfType<CalibrationDataFlippedEvent>().Should().ContainSingle();
         h.Events.OfType<AlertEvent>().Should().ContainSingle(a => a.Code == GuideErrorCode.DecFlipCorrected);
@@ -363,6 +373,129 @@ public class ClosedLoopTests
         text.Should().Contain("Guiding Ends at");
         int rows = text.Split('\n').Count(l => l.Length > 0 && char.IsDigit(l[0]) && l.Contains(",\"Mount\","));
         rows.Should().BeGreaterThan(100);
+    }
+
+    [Test]
+    public async Task Keeps_searching_after_the_lost_star_timeout_and_recovers()
+    {
+        var scenario = SimulatorScenario.GoodMount with
+        {
+            Sky = SimulatorScenario.GoodMount.Sky with { Transparency = [new TransparencyWindow(300, 420, 0.0, 2.0)] },
+        };
+        var h = new Harness(scenario);
+        _ = h.Guider.StartGuidingAsync(Settle);
+        await h.RunFor(TimeSpan.FromMinutes(12));
+
+        h.Events.OfType<AlertEvent>().Should().ContainSingle(a => a.Code == GuideErrorCode.StarReacquireTimeout, "the timeout is reported once");
+        h.Events.OfType<AlertEvent>().Should().Contain(a => a.Code == GuideErrorCode.StarReacquired);
+        var reacquired = h.Events.OfType<AlertEvent>().Last(a => a.Code == GuideErrorCode.StarReacquired).Timestamp;
+        h.Events.OfType<GuideStepEvent>().Should().Contain(s => s.Timestamp > reacquired && s.RaDuration + s.DecDuration > 0, "guiding resumed by itself");
+        h.Guider.State.Should().Be(GuiderState.Stopped, "the run ended with the virtual-time cancellation, not with a failure");
+        var (guided, _) = h.TrueRms(fromSec: 500);
+        guided.Should().BeLessThan(1.0);
+    }
+
+    [Test]
+    public async Task Forced_recalibration_while_guiding_restarts_and_completes()
+    {
+        var h = new Harness(SimulatorScenario.GoodMount);
+        Task<SettleResult>? second = null;
+        h.OnEvent = e =>
+        {
+            if (e is SettleDoneEvent && second is null)
+            {
+                second = h.Guider.StartGuidingAsync(Settle, forceCalibration: true);
+            }
+        };
+
+        _ = h.Guider.StartGuidingAsync(Settle);
+        await h.RunFor(TimeSpan.FromMinutes(15));
+
+        second.Should().NotBeNull();
+        second!.IsCompleted.Should().BeTrue("a forced restart must not hang");
+        (await second).Success.Should().BeTrue();
+        h.Events.OfType<CalibrationCompleteEvent>().Should().HaveCount(2);
+    }
+
+    [Test]
+    public async Task Cancelled_start_never_calibrates_later_when_looping()
+    {
+        var h = new Harness(SimulatorScenario.GoodMount);
+        using var cts = new CancellationTokenSource();
+        bool looped = false;
+        h.OnEvent = e =>
+        {
+            if (e is StarSelectedEvent && !cts.IsCancellationRequested)
+            {
+                // host cancels the start and stops capture (as the plugin does), later the user just loops
+                cts.Cancel();
+                h.Guider.StopGuiding();
+            }
+        };
+
+        var start = h.Guider.StartGuidingAsync(Settle, ct: cts.Token);
+        await h.RunFor(TimeSpan.FromMinutes(2));
+        await FluentActions.Awaiting(() => start).Should().ThrowAsync<OperationCanceledException>();
+
+        // new loop without any guide request
+        h.OnEvent = _ => looped = true;
+        await h.RunFor(TimeSpan.FromMinutes(2));
+        looped.Should().BeTrue();
+        h.Events.OfType<StartCalibrationEvent>().Should().BeEmpty("nobody asked for guiding after the cancellation");
+    }
+
+    [Test]
+    public async Task Lost_star_while_user_paused_starts_no_timeout()
+    {
+        var scenario = SimulatorScenario.GoodMount with
+        {
+            Sky = SimulatorScenario.GoodMount.Sky with { Transparency = [new TransparencyWindow(300, 500, 0.0, 2.0)] },
+        };
+        var h = new Harness(scenario);
+        bool paused = false;
+        h.OnEvent = e =>
+        {
+            if (e is SettleDoneEvent && !paused)
+            {
+                paused = true;
+                h.Guider.Pause();
+            }
+        };
+
+        _ = h.Guider.StartGuidingAsync(Settle);
+        await h.RunFor(TimeSpan.FromMinutes(9));
+
+        h.Events.OfType<AlertEvent>().Should().NotContain(a => a.Code == GuideErrorCode.StarReacquireTimeout);
+        h.Guider.State.Should().Be(GuiderState.Stopped);
+        h.Events.OfType<GuideStepEvent>().Where(s => s.Timestamp > h.Events.OfType<PausedEvent>().First().Timestamp)
+            .Should().OnlyContain(s => s.RaDuration + s.DecDuration == 0, "no corrections while paused");
+    }
+
+    [Test]
+    public async Task User_pause_survives_a_short_slew()
+    {
+        var h = new Harness(SimulatorScenario.GoodMount);
+        int phase = 0;
+        h.OnEvent = e =>
+        {
+            if (phase == 0 && e is SettleDoneEvent)
+            {
+                phase = 1;
+                h.Guider.Pause();
+            }
+            else if (phase == 1 && e is PausedEvent)
+            {
+                phase = 2;
+                h.Sim.Mount.StartSlew(new SkyOffset(0, 0), TimeSpan.FromSeconds(8));
+            }
+        };
+
+        _ = h.Guider.StartGuidingAsync(Settle);
+        await h.RunFor(TimeSpan.FromMinutes(6));
+
+        h.Events.OfType<ResumedEvent>().Should().BeEmpty("the user's pause must not be lifted by the mount watcher");
+        var paused = h.Events.OfType<PausedEvent>().First().Timestamp;
+        h.Events.OfType<GuideStepEvent>().Where(s => s.Timestamp > paused).Should().OnlyContain(s => s.RaDuration + s.DecDuration == 0);
     }
 
     /// <summary>Wires a simulator, a guider and an event recorder together.</summary>
