@@ -24,4 +24,16 @@ public sealed record StarFinderOptions
 
     /// <summary>Image scale ″/px, used by auto downsample.</summary>
     public double PixelScale { get; init; } = 1.0;
+
+    /// <summary>Star find mode used for tracking (PHD2 GetStarFindMode, default centroid).</summary>
+    public StarFindMode FindMode { get; init; } = StarFindMode.Centroid;
+
+    /// <summary>
+    /// Extension (own code, idea from KStars' star selection): when choosing the AutoFind primary,
+    /// de-prioritise candidates that look like hot pixels (lowest HFD quartile and clearly below the
+    /// median HFD), are crowded, or lie close to the frame edge. PHD2's pass structure is kept; within a
+    /// pass the brightest un-penalised candidate wins, falling back to PHD2's choice when every eligible
+    /// candidate is penalised. Set to false for exact PHD2 behaviour.
+    /// </summary>
+    public bool AutoFindScoring { get; init; } = true;
 }
