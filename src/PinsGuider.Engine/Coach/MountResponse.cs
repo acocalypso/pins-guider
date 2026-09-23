@@ -159,6 +159,7 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
 {
     private const int MaxClearingPulses = 15;
     private const int MaxRecenterSteps = 10;
+    private const int MaxRedos = 3;
 
     /// <summary>Frames averaged before and after each response pulse.</summary>
     public const int AverageFrames = 3;
@@ -210,6 +211,12 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
     private int clearCount;
     private int recenterSteps;
     private DateTimeOffset? southStartTime;
+    private Action? lastAction;
+    private IssueKind lastIssueKind;
+    private bool pendingDisturbed;
+    private bool redoing;
+    private int redoCount;
+    private int backlashRestarts;
     private bool waitRequested;
     private DateTimeOffset? origin;
     private double windowSsRa;
@@ -335,7 +342,11 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
         if (!f.StarFound)
         {
             lostSince ??= f.Time;
-            pending = null;
+            if (pending is not null)
+            {
+                Disrupt();
+            }
+
             sincePulse.Clear();
             if ((f.Time - lostSince.Value).TotalSeconds > lostTimeoutSec)
             {
@@ -347,6 +358,19 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
         }
 
         lostSince = null;
+        if (f.PulsesDropped && frame is not null)
+        {
+            // the pulses requested after the previous frame were not sent (the mount turned busy): redo them
+            Disrupt();
+        }
+
+        if (f.MountBusy)
+        {
+            // the mount reports slewing/tracking off (possibly spuriously after a pulse): skip the frame, don't pulse
+            pendingDisturbed |= pending is not null;
+            return [];
+        }
+
         frame = f;
         origin ??= f.Time;
         if (estimatedSteps == 0)
@@ -363,8 +387,18 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
                 return [];
             }
 
-            pending = null;
-            p.Complete(sincePulse.Skip(sincePulse.Count - p.FramesNeeded).ToList());
+            if (pendingDisturbed && MovedDuringCondition(p, f))
+            {
+                // the mount really moved while it reported slewing: don't use a move measured across it
+                Disrupt();
+            }
+            else
+            {
+                pending = null;
+                pendingDisturbed = false;
+                redoCount = 0;
+                p.Complete(sincePulse.Skip(sincePulse.Count - p.FramesNeeded).ToList());
+            }
         }
 
         next = [];
@@ -384,6 +418,17 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
                 waitRequested = false;
                 PrependFirst(action);
                 break;
+            }
+
+            if (next.Count > 0)
+            {
+                if (!redoing)
+                {
+                    redoCount = 0;
+                }
+
+                redoing = false;
+                lastAction = action;
             }
         }
 
@@ -468,17 +513,87 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
     }
 
     /// <summary>Issues a pulse after the current frame; <paramref name="complete"/> gets the next <paramref name="framesAfter"/> frames.</summary>
-    private void Issue(GuideDirection dir, int ms, int framesAfter, Action<IReadOnlyList<CoachFrame>>? complete)
+    private void Issue(GuideDirection dir, int ms, int framesAfter, Action<IReadOnlyList<CoachFrame>>? complete, IssueKind kind = IssueKind.Other)
     {
         next = [new PulseCommand(dir, ms)];
         issued++;
         sincePulse.Clear();
+        lastIssueKind = kind;
+        pendingDisturbed = false;
         if (dir.Axis() == GuideAxis.Dec)
         {
             lastDecDirection = dir;
         }
 
-        pending = complete is null ? null : new Pending(Math.Max(1, framesAfter), complete);
+        var f = frame!;
+        double rate = dir.Axis() == GuideAxis.Ra ? f.Transform.XRate : f.Transform.YRate;
+        double expectedArcmin = ms * Math.Max(rate, 0) * (f.PixelScale > 0 ? f.PixelScale : 1.0) / 60.0;
+        pending = complete is null ? null : new Pending(Math.Max(1, framesAfter), complete, f, expectedArcmin);
+    }
+
+    /// <summary>
+    /// A pulse or its measurement was disturbed (not sent, star lost, real mount motion): redo a response pulse or take-up
+    /// (at most 3 times), restart the backlash test (at most twice, then it is unreliable).
+    /// </summary>
+    private void Disrupt()
+    {
+        pending = null;
+        pendingDisturbed = false;
+        sincePulse.Clear();
+        switch (lastIssueKind)
+        {
+            case IssueKind.Backlash:
+                RestartBacklash();
+                break;
+            default:
+                if (lastAction is { } a && redoCount < MaxRedos)
+                {
+                    redoCount++;
+                    redoing = true;
+                    if (lastIssueKind == IssueKind.Other)
+                    {
+                        // a take-up that was not sent did not engage the gear
+                        lastDecDirection = null;
+                    }
+
+                    PrependFirst(a);
+                }
+
+                break;
+        }
+
+        lastIssueKind = IssueKind.None;
+    }
+
+    private void RestartBacklash()
+    {
+        clearMoves.Clear();
+        southPositions.Clear();
+        southMoves.Clear();
+        southStartTime = null;
+        clearCount = 0;
+        if (backlashRestarts++ < 2)
+        {
+            backlashPoints.Clear();
+            backlashCumulativeMs = 0;
+            backlashStartSet = false;
+            PrependFirst(ClearNorthStep);
+        }
+        else
+        {
+            backlashState = CoachBacklashStates.Unreliable;
+            lastDecDirection = null;
+            PrependEngage(GuideDirection.South);
+        }
+    }
+
+    /// <summary>Whether the mount-reported pointing moved more than the pulse explains while a condition was active.</summary>
+    private static bool MovedDuringCondition(Pending p, CoachFrame now)
+    {
+        var sep = MountStateWatcher.SeparationArcmin(
+            new MountSnapshot { RightAscensionHours = p.IssueFrame.RightAscensionHours, DeclinationDeg = p.IssueFrame.DeclinationDeg },
+            new MountSnapshot { RightAscensionHours = now.RightAscensionHours, DeclinationDeg = now.DeclinationDeg });
+        return sep is { } s && s > Math.Max(0.5, 3 * p.ExpectedArcmin);
     }
 
     /// <summary>Mean mount position and time (s since the start) of frames.</summary>
@@ -544,7 +659,7 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
         double scale = f.PixelScale > 0 ? f.PixelScale : 1.0;
         var before = Mean(sincePulse.Skip(sincePulse.Count - AverageFrames).ToList());
         currentPulse = new PulseCommand(dir, ms);
-        Issue(dir, ms, AverageFrames, afterFrames =>
+        Issue(dir, ms, AverageFrames, kind: IssueKind.Response, complete: afterFrames =>
         {
             AccumulateWindow(afterFrames);
             double moved = Move(dir, before, Mean(afterFrames));
@@ -606,10 +721,10 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
         }
 
         clearCount++;
-        backlashCumulativeMs += backlashPulseMs;
         var before = Mean([f]);
-        Issue(GuideDirection.North, backlashPulseMs, 1, frames =>
+        Issue(GuideDirection.North, backlashPulseMs, 1, kind: IssueKind.Backlash, complete: frames =>
         {
+            backlashCumulativeMs += backlashPulseMs;
             var after = frames[0];
             AddBacklashPoint(after);
             clearMoves.Add(Move(GuideDirection.North, before, Mean(frames)));
@@ -646,10 +761,10 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
             return;
         }
 
-        backlashCumulativeMs += backlashPulseMs;
         var southOrigin = southStartTime ??= f.Time;
-        Issue(GuideDirection.South, backlashPulseMs, 1, frames =>
+        Issue(GuideDirection.South, backlashPulseMs, 1, kind: IssueKind.Backlash, complete: frames =>
         {
+            backlashCumulativeMs += backlashPulseMs;
             var after = frames[0];
             AddBacklashPoint(after);
             double t = (after.Time - southOrigin).TotalSeconds;
@@ -812,10 +927,22 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
 
     private static double? Round(double? v) => v is { } d ? Math.Round(d, 3) : null;
 
-    private sealed class Pending(int framesNeeded, Action<IReadOnlyList<CoachFrame>> complete)
+    private sealed class Pending(int framesNeeded, Action<IReadOnlyList<CoachFrame>> complete, CoachFrame issueFrame, double expectedArcmin)
     {
         public int FramesNeeded { get; } = framesNeeded;
 
+        public CoachFrame IssueFrame { get; } = issueFrame;
+
+        public double ExpectedArcmin { get; } = expectedArcmin;
+
         public void Complete(IReadOnlyList<CoachFrame> after) => complete(after);
+    }
+
+    private enum IssueKind
+    {
+        None,
+        Response,
+        Backlash,
+        Other,
     }
 }

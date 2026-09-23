@@ -62,6 +62,13 @@ public sealed record SafetySettings
 
     /// <summary>Processing time per frame (ms) above which a slow-processing warning is raised.</summary>
     public double SlowProcessingMs { get; init; } = 500;
+
+    /// <summary>
+    /// Guiding Coach: seconds a Slewing/Homing/TrackingOff report must persist before it interrupts a session (a real goto
+    /// that moves more than <see cref="LargeMoveArcmin"/> interrupts at once). Must exceed the longest pulse plus INDI's 3 s
+    /// coordinate-motion window, which can report "slewing" briefly after guide pulses.
+    /// </summary>
+    public double CoachMountInterruptSeconds { get; init; } = 8;
 }
 
 public enum SafetyVerdict
@@ -291,22 +298,93 @@ public sealed class MountStateWatcher(SafetySettings settings)
         pausedAt = null;
     }
 
-    private bool MovedFar(MountSnapshot a, MountSnapshot b)
-    {
-        if (a.PierSide != PierSide.Unknown && b.PierSide != PierSide.Unknown && a.PierSide != b.PierSide)
-        {
-            return true;
-        }
+    private bool MovedFar(MountSnapshot a, MountSnapshot b) => MovedFar(a, b, settings.LargeMoveArcmin);
 
+    /// <summary>True when the pier side changed or the pointing moved more than <paramref name="limitArcmin"/>.</summary>
+    internal static bool MovedFar(MountSnapshot a, MountSnapshot b, double limitArcmin) =>
+        a.PierSide != PierSide.Unknown && b.PierSide != PierSide.Unknown && a.PierSide != b.PierSide
+        || SeparationArcmin(a, b) is { } sep && sep > limitArcmin;
+
+    /// <summary>Pointing separation between two snapshots (arcmin), null without coordinates.</summary>
+    internal static double? SeparationArcmin(MountSnapshot a, MountSnapshot b)
+    {
         if (a.RightAscensionHours is not { } ra1 || b.RightAscensionHours is not { } ra2 || a.DeclinationDeg is not { } d1 || b.DeclinationDeg is not { } d2)
         {
-            return false;
+            return null;
         }
 
         double dra = (ra2 - ra1) * 15.0;
         dra = ((dra + 540) % 360) - 180;
-        double sep = Math.Sqrt(Math.Pow(dra * Math.Cos(d1 * Math.PI / 180), 2) + Math.Pow(d2 - d1, 2)) * 60.0;
-        return sep > settings.LargeMoveArcmin;
+        return Math.Sqrt(Math.Pow(dra * Math.Cos(d1 * Math.PI / 180), 2) + Math.Pow(d2 - d1, 2)) * 60.0;
+    }
+}
+
+/// <summary>Verdict of the <see cref="CoachMountGate"/>.</summary>
+/// <param name="Busy">A mount condition (slewing, homing, tracking off, ...) is active: measurements skip the frame.</param>
+/// <param name="InterruptReason">Set when the condition interrupts the coach session (a <c>CoachInterruptReasons</c> value).</param>
+internal readonly record struct CoachMountVerdict(bool Busy, string? InterruptReason);
+
+/// <summary>
+/// Debounces mount-state reports for Guiding Coach sessions (shared by the guide loop and the camera check). Disconnected
+/// and Parked interrupt at once. Slewing, Homing and TrackingOff interrupt only when they persist for
+/// <see cref="SafetySettings.CoachMountInterruptSeconds"/>, or at once when the pointing moved more than
+/// <see cref="SafetySettings.LargeMoveArcmin"/> since the condition started (a real goto); until then the frames are only
+/// marked busy. Some INDI drivers report "slewing" for a few seconds after guide pulses (coordinate-motion heuristics), which
+/// must not cancel a session. Normal guiding is not affected (it still pauses at once). Thread-safe.
+/// </summary>
+internal sealed class CoachMountGate
+{
+    private readonly object gate = new();
+    private DateTimeOffset? since;
+    private MountSnapshot? start;
+
+    public void Reset()
+    {
+        lock (gate)
+        {
+            since = null;
+            start = null;
+        }
+    }
+
+    public CoachMountVerdict Update(MountSnapshot m, DateTimeOffset now, SafetySettings settings)
+    {
+        var reason = MountStateWatcher.Evaluate(m);
+        lock (gate)
+        {
+            if (reason == MountPauseReason.None)
+            {
+                // a goto that finished between two checks: the pointing moved far while the condition was active
+                bool movedFar = start is not null && MountStateWatcher.MovedFar(start, m, settings.LargeMoveArcmin);
+                since = null;
+                start = null;
+                return new CoachMountVerdict(false, movedFar ? Coach.CoachInterruptReasons.Slew : null);
+            }
+
+            if (reason == MountPauseReason.Disconnected)
+            {
+                return new CoachMountVerdict(true, Coach.CoachInterruptReasons.Disconnect);
+            }
+
+            if (reason == MountPauseReason.Parked)
+            {
+                return new CoachMountVerdict(true, Coach.CoachInterruptReasons.Slew);
+            }
+
+            since ??= now;
+            start ??= m;
+            if (MountStateWatcher.MovedFar(start, m, settings.LargeMoveArcmin))
+            {
+                return new CoachMountVerdict(true, Coach.CoachInterruptReasons.Slew);
+            }
+
+            if ((now - since.Value).TotalSeconds >= settings.CoachMountInterruptSeconds)
+            {
+                return new CoachMountVerdict(true, reason == MountPauseReason.TrackingOff ? Coach.CoachInterruptReasons.TrackingOff : Coach.CoachInterruptReasons.Slew);
+            }
+
+            return new CoachMountVerdict(true, null);
+        }
     }
 }
 

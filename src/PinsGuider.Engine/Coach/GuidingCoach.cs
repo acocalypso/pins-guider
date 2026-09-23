@@ -776,7 +776,6 @@ public sealed class GuidingCoach
                 for (int i = 0; i < combos.Count; i++)
                 {
                     ct.ThrowIfCancellationRequested();
-                    CheckMount();
                     var c = combos[i];
                     SetDetail(FormattableString.Invariant($"exposure {c.ExposureSeconds:0.##}s gain {(c.Gain is { } g ? g.ToString(CultureInfo.InvariantCulture) : "default")}"),
                         CoachDetailCodes.CameraCombination,
@@ -786,7 +785,7 @@ public sealed class GuidingCoach
                     try
                     {
                         measured = await sweep.MeasureAsync(c, options.FramesPerCombination, s.Binning, s.Offset, s.StarFinder with { PixelScale = scale },
-                            s.MultiStar.MaxListSize, PublishFrame, ct).ConfigureAwait(false);
+                            s.MultiStar.MaxListSize, PublishFrame, ct, WaitForMountAsync).ConfigureAwait(false);
                     }
                     catch (OperationCanceledException)
                     {
@@ -1774,24 +1773,28 @@ public sealed class GuidingCoach
             }
         }
 
-        private void CheckMount()
+        /// <summary>
+        /// Camera check side of the mount debounce (<see cref="CoachMountGate"/>): waits while the mount reports a condition
+        /// that is not confirmed yet, interrupts the session once it is.
+        /// </summary>
+        private async Task WaitForMountAsync(CancellationToken ct)
         {
-            MountSnapshot m;
-            try
+            while (true)
             {
-                m = guider.MountState.GetSnapshot();
-            }
-            catch
-            {
-                return;
-            }
+                var verdict = guider.CheckCoachMount();
+                if (verdict.InterruptReason is { } reason)
+                {
+                    OnInterrupt(reason);
+                    guider.DetachCoach();
+                    cts.Token.ThrowIfCancellationRequested();
+                }
 
-            var reason = MountStateWatcher.Evaluate(m);
-            if (reason is MountPauseReason.Slewing or MountPauseReason.Homing or MountPauseReason.Parked or MountPauseReason.Disconnected)
-            {
-                OnInterrupt(reason == MountPauseReason.Disconnected ? CoachInterruptReasons.Disconnect : CoachInterruptReasons.Slew);
-                guider.DetachCoach();
-                cts.Token.ThrowIfCancellationRequested();
+                if (!verdict.Busy)
+                {
+                    return;
+                }
+
+                await clock.Delay(TimeSpan.FromMilliseconds(500), ct).ConfigureAwait(false);
             }
         }
 

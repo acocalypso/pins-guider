@@ -3,6 +3,7 @@
 using FluentAssertions;
 using NUnit.Framework;
 using PinsGuider.Engine.Coach;
+using PinsGuider.Engine.Core;
 using PinsGuider.Engine.Guiding;
 using PinsGuider.Engine.Simulation;
 
@@ -354,24 +355,129 @@ public class CoachClosedLoopTests
     }
 
     [Test]
-    public async Task Mount_slew_interrupts_the_session()
+    public async Task A_real_goto_interrupts_with_slew_within_a_frame()
     {
         var h = new Harness(SimulatorScenario.GoodMount);
-        bool slewed = false;
+        DateTimeOffset? slewAt = null;
         h.OnEvent = e =>
         {
-            if (!slewed && e is CoachStatusEvent { Status: { Step: CoachStepNames.Drift, Drift.ElapsedSeconds: > 20 } })
+            if (slewAt is null && e is CoachStatusEvent { Status: { Step: CoachStepNames.Drift, Drift.ElapsedSeconds: > 20 } })
             {
-                slewed = true;
-                h.Sim.Mount.StartSlew(new SkyOffset(0, 0), TimeSpan.FromSeconds(8));
+                slewAt = e.Timestamp;
+                h.Sim.Mount.StartSlew(new SkyOffset(3600, 0), TimeSpan.FromSeconds(2));
+            }
+        };
+        var status = await h.RunFromGuiding(new CoachOptions { Steps = [CoachStepNames.Drift] }, expectGuiding: false);
+
+        TestContext.Out.WriteLine($"phase {status.Phase} {status.MessageCode} {status.Message} " + string.Join(";", status.Steps.Select(x => x.Name + " " + x.State + " " + x.MessageCode)));
+        status.Phase.Should().Be(CoachPhases.Cancelled);
+        status.MessageCode.Should().Be(CoachCodes.Interrupted);
+        status.MessageParameters["reason"].Should().Be(CoachInterruptReasons.Slew);
+        var cancelled = h.Events.OfType<CoachStatusEvent>().First(c => c.Status.Phase == CoachPhases.Cancelled).Timestamp;
+        (cancelled - slewAt!.Value).TotalSeconds.Should().BeLessThan(5, "a goto moving more than 5′ interrupts at the next frame after the move");
+        h.Events.OfType<PausedEvent>().Should().ContainSingle(p => p.Reason == "Slewing", "the guider's own auto-pause takes over");
+        h.AssertRestoredAndGuiding(expectGuiding: false);
+    }
+
+    [Test]
+    public async Task Spurious_slewing_after_pulses_does_not_cancel_the_coach()
+    {
+        // an INDI-like mount: "slewing" for 0.5–3 s after every pulse and at random moments
+        var h = new Harness(SimulatorScenario.GoodMount, flaky: true);
+        h.OnEvent = e =>
+        {
+            if (e is CoachStatusEvent { Status.Phase: not (CoachPhases.Running or CoachPhases.Idle) })
+            {
+                // afterwards a quiet mount, so resumed guiding can be checked without auto-pauses
+                h.Flaky!.BusyAfterPulse = null;
+                h.Flaky.RandomBusyPerMinute = 0;
+            }
+        };
+
+        // from the session start on (calibration itself fails on any slewing report, as it always did)
+        var status = await h.RunFromGuiding(new CoachOptions
+        {
+            ExposureSeconds = [1, 2],
+            Gains = [0],
+            FramesPerCombination = 3,
+            DriftSeconds = 120,
+            TrialSeconds = 60,
+        }, TimeSpan.FromMinutes(120), atStart: x =>
+        {
+            x.Flaky!.BusyAfterPulse = (0.5, 3.0);
+            x.Flaky.RandomBusyPerMinute = 1.0;
+        });
+
+        TestContext.Out.WriteLine($"busy reports: {h.Flaky!.BusyReports}, trials {string.Join(", ", status.Trials.Select(t => $"{t.Id} {t.State} {t.ElapsedSeconds}s"))}");
+        status.Phase.Should().Be(CoachPhases.Complete, status.Message);
+        status.Steps.Should().OnlyContain(s => s.State == CoachStepStates.Done);
+        status.Findings.Should().NotContain(f => f.Code == CoachCodes.Interrupted);
+        status.Response!.Pulses.Should().HaveCount(32, "every response pulse is measured (redone when it was not sent)");
+        status.Findings.Should().NotContain(f => f.Code == CoachCodes.ResponseMinPulse, "busy frames are skipped, not measured as no motion");
+        status.Trials.Where(t => t.State == CoachTrialStates.Done).Should().OnlyContain(t => t.ElapsedSeconds >= 60);
+        h.Flaky.BusyReports.Should().BeGreaterThan(20, "the mount really reported slewing many times");
+        h.AssertRestoredAndGuiding();
+    }
+
+    [Test]
+    public async Task A_stuck_slewing_flag_interrupts_after_the_debounce_time()
+    {
+        var h = new Harness(SimulatorScenario.GoodMount, flaky: true);
+        DateTimeOffset? stuckAt = null;
+        h.OnEvent = e =>
+        {
+            if (stuckAt is null && e is CoachStatusEvent { Status: { Step: CoachStepNames.Drift, Drift.ElapsedSeconds: > 20 } })
+            {
+                stuckAt = e.Timestamp;
+                h.Flaky!.Slewing(e.Timestamp, TimeSpan.FromSeconds(10));
             }
         };
         var status = await h.RunFromGuiding(new CoachOptions { Steps = [CoachStepNames.Drift] });
 
-        status.Phase.Should().Be(CoachPhases.Cancelled);
         status.MessageCode.Should().Be(CoachCodes.Interrupted);
         status.MessageParameters["reason"].Should().Be(CoachInterruptReasons.Slew);
-        h.Events.OfType<PausedEvent>().Should().ContainSingle(p => p.Reason == "Slewing", "the guider's own auto-pause takes over");
+        var cancelled = h.Events.OfType<CoachStatusEvent>().First(c => c.Status.Phase == CoachPhases.Cancelled).Timestamp;
+        (cancelled - stuckAt!.Value).TotalSeconds.Should().BeInRange(8, 11.5, "interrupted once the report persisted 8 s");
+        h.AssertRestoredAndGuiding();
+    }
+
+    [Test]
+    public async Task Tracking_off_for_long_interrupts_with_trackingOff()
+    {
+        var h = new Harness(SimulatorScenario.GoodMount, flaky: true);
+        bool done = false;
+        h.OnEvent = e =>
+        {
+            if (!done && e is CoachStatusEvent { Status: { Step: CoachStepNames.Drift, Drift.ElapsedSeconds: > 20 } })
+            {
+                done = true;
+                h.Flaky!.TrackingOff(e.Timestamp, TimeSpan.FromSeconds(10));
+            }
+        };
+        var status = await h.RunFromGuiding(new CoachOptions { Steps = [CoachStepNames.Drift] });
+
+        status.MessageCode.Should().Be(CoachCodes.Interrupted);
+        status.MessageParameters["reason"].Should().Be(CoachInterruptReasons.TrackingOff);
+        h.AssertRestoredAndGuiding();
+    }
+
+    [Test]
+    public async Task Tracking_off_briefly_does_not_cancel_the_coach()
+    {
+        var h = new Harness(SimulatorScenario.GoodMount, flaky: true);
+        bool done = false;
+        h.OnEvent = e =>
+        {
+            if (!done && e is CoachStatusEvent { Status: { Step: CoachStepNames.Drift, Drift.ElapsedSeconds: > 20 } })
+            {
+                done = true;
+                h.Flaky!.TrackingOff(e.Timestamp, TimeSpan.FromSeconds(2));
+            }
+        };
+        var status = await h.RunFromGuiding(new CoachOptions { Steps = [CoachStepNames.Drift] });
+
+        status.Phase.Should().Be(CoachPhases.Complete, status.Message);
+        h.Flaky!.BusyReports.Should().BeGreaterThan(0, "the tracking-off report was seen");
         h.AssertRestoredAndGuiding();
     }
 
@@ -501,13 +607,17 @@ public class CoachClosedLoopTests
         private int framesAfter;
         private DateTimeOffset? finishedAt;
 
-        public Harness(SimulatorScenario scenario, Func<GuiderSettings, GuiderSettings>? configure = null)
+        public Harness(SimulatorScenario scenario, Func<GuiderSettings, GuiderSettings>? configure = null, bool flaky = false)
         {
             Clock = new VirtualClock();
             Sim = new Simulator(scenario, Clock);
             var settings = new GuiderSettings { FocalLengthMm = scenario.Camera.FocalLengthMm, ExposureMs = 2000 };
             initialSettings = configure?.Invoke(settings) ?? settings;
-            Guider = new Guider(Sim.Camera, Sim.Mount, Sim.Mount, Clock, initialSettings, ditherSeed: 5) { AutoStartLoop = false };
+            Flaky = flaky ? new FlakyMount(Sim.Mount, Clock) : null;
+            Guider = new Guider(Sim.Camera, (IPulseOutput?)Flaky ?? Sim.Mount, (IMountState?)Flaky ?? Sim.Mount, Clock, initialSettings, ditherSeed: 5)
+            {
+                AutoStartLoop = false,
+            };
             Host = new SimpleCoachHost(Guider) { ImagingScale = 1.0, ProfileName = "Test" };
             Coach = new GuidingCoach(Guider, Host);
             Guider.EventRaised += (_, e) =>
@@ -539,6 +649,9 @@ public class CoachClosedLoopTests
 
         public VirtualClock Clock { get; }
 
+        /// <summary>Mount state double around the simulated mount (null unless requested).</summary>
+        public FlakyMount? Flaky { get; }
+
         public Simulator Sim { get; }
 
         public Guider Guider { get; }
@@ -563,7 +676,8 @@ public class CoachClosedLoopTests
         public bool WasGuidingBefore { get; private set; }
 
         /// <summary>Starts guiding, runs the coach once settled, waits for the session and a few guided frames afterwards.</summary>
-        public async Task<CoachStatus> RunFromGuiding(CoachOptions options, TimeSpan? virtualBudget = null, Action<Harness>? atStart = null)
+        public async Task<CoachStatus> RunFromGuiding(CoachOptions options, TimeSpan? virtualBudget = null, Action<Harness>? atStart = null,
+            bool expectGuiding = true)
         {
             WasGuidingBefore = true;
             bool started = false;
@@ -580,7 +694,7 @@ public class CoachClosedLoopTests
             };
 
             _ = Guider.StartGuidingAsync(Settle);
-            return await Run(virtualBudget ?? TimeSpan.FromMinutes(60), expectGuiding: true);
+            return await Run(virtualBudget ?? TimeSpan.FromMinutes(60), expectGuiding);
         }
 
         /// <summary>Starts looping with a selected star (no guiding), then runs the coach.</summary>
@@ -608,6 +722,14 @@ public class CoachClosedLoopTests
             Coach.LoopToken = deadline;
             Guider.StartLooping(deadline);
             var done = await Task.WhenAny(finished.Task, Task.Delay(TimeSpan.FromMinutes(4)));
+            if (done != finished.Task)
+            {
+                var st = Coach.Status;
+                TestContext.Out.WriteLine($"TIMEOUT at {Clock.ElapsedSeconds:F0}s: step {st.Step}, guider {Guider.State}, loop {Guider.IsLoopRunning}; " +
+                    string.Join("; ", st.Steps.Select(x => $"{x.Name} {x.State} {x.Detail} {x.Progress}")) + "; trials " +
+                    string.Join(", ", st.Trials.Select(t => $"{t.Id} {t.State} {t.ElapsedSeconds}s {t.Frames}f")) + $"; pulses {st.Response?.Pulses.Count}");
+            }
+
             done.Should().BeSameAs(finished.Task, "the session must finish in reasonable wall time");
             var status = await finished.Task;
             (await Task.WhenAny(Coach.Completion, Task.Delay(TimeSpan.FromMinutes(1)))).Should().BeSameAs(Coach.Completion);
@@ -642,6 +764,91 @@ public class CoachClosedLoopTests
             {
                 a.State.Should().BeOneOf(GuiderState.Guiding, GuiderState.LostLock, GuiderState.Reacquiring);
                 a.PulsedStepsAfter.Should().BeGreaterThanOrEqualTo(5, "guiding with corrections continues after the session");
+            }
+        }
+    }
+
+    /// <summary>
+    /// INDI-like mount state double around the simulated mount: reports "slewing" for a while after pulses, at random moments
+    /// or in forced windows (without moving), and tracking off in forced windows.
+    /// </summary>
+    private sealed class FlakyMount(SimulatedMount inner, VirtualClock clock) : IPulseOutput, IMountState
+    {
+        private readonly object gate = new();
+        private readonly Random rng = new(17);
+        private readonly List<(double Start, double End, bool Tracking)> windows = [];
+        private double busyUntil = double.NegativeInfinity;
+        private double nextRandom = double.NaN;
+        private bool wasBusy;
+
+        public (double Min, double Max)? BusyAfterPulse { get; set; }
+
+        public double RandomBusyPerMinute { get; set; }
+
+        /// <summary>Number of times the double started to report a condition.</summary>
+        public int BusyReports { get; private set; }
+
+        public string Name => inner.Name;
+
+        public bool IsConnected => inner.IsConnected;
+
+        public bool SupportsSimultaneousPulses => inner.SupportsSimultaneousPulses;
+
+        public void Slewing(DateTimeOffset from, TimeSpan duration) => Add(from, duration, tracking: false);
+
+        public void TrackingOff(DateTimeOffset from, TimeSpan duration) => Add(from, duration, tracking: true);
+
+        public async Task PulseAsync(Core.GuideDirection direction, int durationMs, CancellationToken ct)
+        {
+            await inner.PulseAsync(direction, durationMs, ct);
+            lock (gate)
+            {
+                if (BusyAfterPulse is { } b)
+                {
+                    busyUntil = Math.Max(busyUntil, clock.ElapsedSeconds + b.Min + rng.NextDouble() * (b.Max - b.Min));
+                }
+            }
+        }
+
+        public MountSnapshot GetSnapshot()
+        {
+            var m = inner.GetSnapshot();
+            lock (gate)
+            {
+                double now = clock.ElapsedSeconds;
+                if (RandomBusyPerMinute > 0)
+                {
+                    if (double.IsNaN(nextRandom))
+                    {
+                        nextRandom = now + 60.0 / RandomBusyPerMinute * rng.NextDouble();
+                    }
+
+                    if (now >= nextRandom)
+                    {
+                        busyUntil = Math.Max(busyUntil, now + 1 + 2 * rng.NextDouble());
+                        nextRandom = now + 60.0 / RandomBusyPerMinute * (0.5 + rng.NextDouble());
+                    }
+                }
+
+                bool slewing = now < busyUntil || windows.Any(w => !w.Tracking && now >= w.Start && now < w.End);
+                bool trackingOff = windows.Any(w => w.Tracking && now >= w.Start && now < w.End);
+                bool busy = slewing || trackingOff;
+                if (busy && !wasBusy)
+                {
+                    BusyReports++;
+                }
+
+                wasBusy = busy;
+                return m with { IsSlewing = m.IsSlewing || slewing, IsTracking = m.IsTracking && !trackingOff };
+            }
+        }
+
+        private void Add(DateTimeOffset from, TimeSpan duration, bool tracking)
+        {
+            lock (gate)
+            {
+                double start = (from - clock.Epoch).TotalSeconds;
+                windows.Add((start, start + duration.TotalSeconds, tracking));
             }
         }
     }

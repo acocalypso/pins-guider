@@ -157,8 +157,17 @@ Session rules:
 * Accepted from Stopped/Looping/Selected/Guiding/Paused; rejected while calibrating, building darks, disconnected or
   when another session runs (`coach.busy`, `coach.notConnected`).
 * Guiding active at the start → resumed with the original settings when the session ends/cancels/fails.
-* External Start/Stop guiding, dither, loop stop, disconnect or a mount slew cancel the session (`coach.interrupted`
-  with parameter `reason`); temporary settings are restored in every exit path.
+* External Start/Stop guiding, dither, loop stop, disconnect or a confirmed mount slew/tracking stop cancel the session
+  (`coach.interrupted` with parameter `reason`); temporary settings are restored in every exit path.
+* Mount-state debounce (one rule for the guide loop and the camera check): Disconnected → `disconnect` and Parked →
+  `slew` interrupt at once. Slewing/Homing (`slew`) and TrackingOff (`trackingOff`) interrupt only when the report
+  persists ≥ `SafetySettings.CoachMountInterruptSeconds` (default 8 s; must exceed the longest pulse plus INDI's 3 s
+  coordinate-motion window, which can report "slewing" after guide pulses), or at once when the pointing moved more than
+  `LargeMoveArcmin` since the report started (a real goto, also when it ended between two checks); the timer resets when
+  the report clears. While a report is active but not confirmed: drift samples are skipped; the pulse test skips the frames
+  (a pulse that was not sent, or whose measurement spans a real mount motion, is redone, at most 3 times; the backlash test
+  restarts); the camera check waits; trials keep guiding under the guider's normal pause, and the paused time does not
+  count toward `TrialSeconds`. Normal guiding outside a session is unchanged (corrections pause at once).
 * Measurement frames (CameraCheck, Drift, MountResponse) are excluded from the guiding stats and safety monitors;
   trials use normal guiding (stats and safety active; runaway during a trial fails that trial, not the session).
 * Setting names in `Changes` are the plugin setting names (`AdvancedGuiderSetting.Name`): ExposureSeconds, Gain,
@@ -167,7 +176,7 @@ Session rules:
 
 Failure/step message codes: `coach.busy`, `coach.notConnected`, `coach.noStar`, `coach.noCalibration`,
 `coach.calibrationFailed`, `coach.starLost`, `coach.noPulseOutput`, `coach.interrupted` {reason: guiding|dither|
-stopped|slew|disconnect}, `coach.cameraError`, `coach.internal`.
+stopped|slew|trackingOff|disconnect}, `coach.cameraError`, `coach.internal`.
 
 ## 7. Finding catalogue
 
@@ -228,6 +237,7 @@ Severity in brackets; `→` = setting changes carried in `Changes`. Parameter un
   dead band is D = k·P − (y′₀ − y′ₖ)/r (averaged over two points, drift-corrected). No PHD2 low bias; asymmetric Dec rates
   are handled (D is South pulse time).
 * **Interrupts**: host guiding commands (start/stop guiding, pause/resume, dither, star selection, lock position, clear
-  calibration, loop start/stop), mount slews/park/disconnect, camera failure and loop end cancel the session with
+  calibration, loop start/stop), confirmed mount slews/tracking stops (debounced, see §6), park/disconnect, camera failure
+  and a cancelled loop cancel the session with
   `coach.interrupted` {reason}; the guider state is then left to the host. A runaway or unresponsive mount during a trial
   fails only that trial. Cancel and normal end resume guiding with the original settings when it was active at the start.
