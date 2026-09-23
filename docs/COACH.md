@@ -93,9 +93,11 @@ Candidate settings sets derived from the previous steps:
   ±0.15 or the alternative exposure);
 * **A′ – current again** (optional `RepeatBaseline`, default on) to detect changing conditions.
 Each trial: apply temporarily, settle (tolerance from the profile, max 30 s), then guide `TrialSeconds`,
-measure RMS RA/Dec/total, peak, oscillation index, frames. Significance: the standard error of a trial's RMS is
-≈ RMS/√(2N) for N frames. The best alternative (B or C) is declared `trials.winner` only if its improvement over A
-exceeds 2 × the combined standard error of the two RMS values; otherwise `trials.noImprovement` (the current settings
+measure RMS RA/Dec/total, peak, oscillation index, frames. Significance: guide errors are autocorrelated, so each
+trial uses an effective sample size N_eff = N·(1−ρ)/(1+ρ) from the lag-1 autocorrelation ρ of its guide-step errors
+(per axis, ρ clamped to [0, 0.95]; the smaller of the two axes is used), and the standard error of its RMS is
+≈ RMS/√(2·N_eff). The best alternative (B or C) is declared `trials.winner` only if its improvement over A exceeds
+2 × the combined standard error of the two RMS values; otherwise `trials.noImprovement` (the current settings
 are as good as the alternatives within the noise; B and C stay applicable as `trial:<id>`). If A and A′ differ by
 > 25 % **and** by more than 2 combined standard errors, a `trials.conditionsChanged` finding warns that the comparison
 is unreliable. Settings are restored at the end (the user applies the winner explicitly).

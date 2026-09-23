@@ -355,6 +355,7 @@ public sealed class GuidingCoach
         private readonly List<CoachFinding> findings = [];
         private readonly List<CoachCameraResult> cameraResults = [];
         private readonly List<CoachTrial> trials = [];
+        private readonly Dictionary<string, double> effectiveFrames = [];
 
         private CancellationTokenSource? stepCts;
         private volatile string? interruptReason;
@@ -1349,6 +1350,14 @@ public sealed class GuidingCoach
             var obs = await WaitHookAsync(observer.Completion, observer.Stop, ct, sessionCt).ConfigureAwait(false);
             await OnLoopAsync(guider.SetCoachHookAsync(null)).ConfigureAwait(false);
             var final = TrialStatistics.Compute(obs.Samples, obs.PixelScale);
+            if (final is not null)
+            {
+                lock (gate)
+                {
+                    effectiveFrames[trial.Id] = final.EffectiveFrames;
+                }
+            }
+
             if (obs.Failure is not null || obs.StarLost)
             {
                 UpdateTrial(index, t => ApplyStats(t, final, obs.ElapsedSeconds) with { State = CoachTrialStates.Failed });
@@ -1589,12 +1598,15 @@ public sealed class GuidingCoach
         private void TrialFindings()
         {
             List<CoachTrial> list;
+            Dictionary<string, double> neff;
             lock (gate)
             {
                 list = trials.ToList();
+                neff = new Dictionary<string, double>(effectiveFrames);
             }
 
-            var verdict = TrialJudge.Judge(list);
+            // autocorrelated guide errors: judged with the effective number of independent frames of each trial
+            var verdict = TrialJudge.Judge(list, neff);
             if (verdict.Baseline is not { } baseline)
             {
                 return;
