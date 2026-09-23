@@ -139,8 +139,13 @@ internal sealed class DriftMeasurement(double targetSeconds, double lostTimeoutS
 public readonly record struct TrialSample(double T, double RaPx, double DecPx, double Snr);
 
 /// <summary>Statistics of a guided trial.</summary>
+/// <param name="RhoRa">Lag-1 autocorrelation of the RA errors (unclamped; likewise Dec).</param>
+/// <param name="EffectiveFrames">
+/// Effective number of independent frames: the smaller of the per-axis N·(1−ρ²)/(1+ρ²), ρ clamped to [0, 0.95]
+/// (see <see cref="TrialJudge.EffectiveFrames"/>).
+/// </param>
 public sealed record TrialStatistics(int Frames, double RmsRaArcsec, double RmsDecArcsec, double RmsTotalArcsec, double PeakArcsec, double OscillationIndex,
-    double? SnrAvg)
+    double? SnrAvg, double RhoRa = 0, double RhoDec = 0, double EffectiveFrames = 0)
 {
     /// <summary>
     /// RMS per axis as population σ about the mean (like the guiding statistics), total = hypot, peak = max distance from
@@ -169,8 +174,10 @@ public sealed record TrialStatistics(int Frames, double RmsRaArcsec, double RmsD
         }
 
         var snr = samples.Where(s => s.Snr > 0).Select(s => s.Snr).ToList();
+        double rhoRa = TrialJudge.LagOneAutocorrelation(samples.Select(s => s.RaPx).ToList());
+        double rhoDec = TrialJudge.LagOneAutocorrelation(samples.Select(s => s.DecPx).ToList());
         return new TrialStatistics(n, rr * scale, rd * scale, Math.Sqrt(rr * rr + rd * rd) * scale, peak * scale, 1.0 - (double)same / (n - 1),
-            snr.Count > 0 ? snr.Average() : null);
+            snr.Count > 0 ? snr.Average() : null, rhoRa, rhoDec, Math.Min(TrialJudge.EffectiveFrames(n, rhoRa), TrialJudge.EffectiveFrames(n, rhoDec)));
     }
 }
 
@@ -188,22 +195,67 @@ public sealed record TrialStatistics(int Frames, double RmsRaArcsec, double RmsD
 public sealed record TrialVerdict(CoachTrial? Baseline, CoachTrial? Winner, CoachTrial? Best, bool Significant, double? ImprovementPercent,
     double? ConditionsChangePercent, bool ConditionsChanged);
 
-/// <summary>Judges trials against the noise of their RMS values.</summary>
+/// <summary>
+/// Judges trials against the noise of their RMS values. Guide errors are autocorrelated (a frame's error persists into the
+/// next), so the standard error uses an effective sample size instead of the frame count.
+/// </summary>
 public static class TrialJudge
 {
+    /// <summary>Upper clamp of the lag-1 autocorrelation.</summary>
+    public const double MaxRho = 0.95;
     /// <summary>Relative change of the baseline (A vs A2) that counts as changed conditions.</summary>
     public const double ConditionsChangeThreshold = 0.25;
 
     /// <summary>Differences must exceed this many combined standard errors.</summary>
     public const double SignificanceSigmas = 2.0;
 
-    /// <summary>Standard error of a trial's RMS: RMS/√(2N) for N frames.</summary>
-    public static double StandardError(CoachTrial t) => (t.RmsTotalArcsec ?? 0) / Math.Sqrt(2.0 * Math.Max(1, t.Frames));
+    /// <summary>Lag-1 autocorrelation about the mean (0 for fewer than 3 values or no variance).</summary>
+    public static double LagOneAutocorrelation(IReadOnlyList<double> values)
+    {
+        int n = values.Count;
+        if (n < 3)
+        {
+            return 0;
+        }
+
+        double m = values.Average();
+        double num = 0, den = 0;
+        for (int i = 0; i < n; i++)
+        {
+            double d = values[i] - m;
+            den += d * d;
+            if (i > 0)
+            {
+                num += d * (values[i - 1] - m);
+            }
+        }
+
+        return den > 0 ? num / den : 0;
+    }
+
+    /// <summary>
+    /// Effective sample size for a variance (RMS) estimate of an AR(1) series: N·(1−ρ²)/(1+ρ²), ρ clamped to [0, 0.95].
+    /// (The mean-based N·(1−ρ)/(1+ρ) would be too conservative for comparing RMS values.)
+    /// </summary>
+    public static double EffectiveFrames(int frames, double rho)
+    {
+        double r = double.IsFinite(rho) ? Math.Clamp(rho, 0, MaxRho) : 0;
+        return frames * (1 - r * r) / (1 + r * r);
+    }
+
+    /// <summary>
+    /// Standard error of a trial's RMS: RMS/√(2·N_eff); <paramref name="effectiveFrames"/> null = the frame count (independent frames).
+    /// </summary>
+    public static double StandardError(CoachTrial t, double? effectiveFrames = null) =>
+        (t.RmsTotalArcsec ?? 0) / Math.Sqrt(2.0 * Math.Max(1, effectiveFrames ?? t.Frames));
 
     /// <summary>Combined standard error of the difference of two trials' RMS values.</summary>
-    public static double CombinedStandardError(CoachTrial a, CoachTrial b) => Math.Sqrt(Sq(StandardError(a)) + Sq(StandardError(b)));
+    public static double CombinedStandardError(CoachTrial a, CoachTrial b, IReadOnlyDictionary<string, double>? effectiveFrames = null) =>
+        Math.Sqrt(Sq(StandardError(a, Neff(a, effectiveFrames))) + Sq(StandardError(b, Neff(b, effectiveFrames))));
 
-    public static TrialVerdict Judge(IReadOnlyList<CoachTrial> trials)
+    /// <param name="trials">Trials of the session.</param>
+    /// <param name="effectiveFrames">Effective sample size per trial id (<see cref="TrialStatistics.EffectiveFrames"/>); trials without one use their frame count.</param>
+    public static TrialVerdict Judge(IReadOnlyList<CoachTrial> trials, IReadOnlyDictionary<string, double>? effectiveFrames = null)
     {
         var done = trials.Where(t => t.State == CoachTrialStates.Done && t.RmsTotalArcsec is > 0).ToList();
         var a = done.FirstOrDefault(t => t.Id == CoachTrialIds.A);
@@ -217,7 +269,7 @@ public static class TrialJudge
         {
             double diff = Math.Abs(a2.RmsTotalArcsec!.Value - a.RmsTotalArcsec!.Value);
             changePercent = diff / a.RmsTotalArcsec.Value * 100;
-            changed = diff > ConditionsChangeThreshold * a.RmsTotalArcsec.Value && diff > SignificanceSigmas * CombinedStandardError(a, a2);
+            changed = diff > ConditionsChangeThreshold * a.RmsTotalArcsec.Value && diff > SignificanceSigmas * CombinedStandardError(a, a2, effectiveFrames);
         }
 
         if (baseline is null)
@@ -232,10 +284,13 @@ public static class TrialJudge
         }
 
         double improvement = baseline.RmsTotalArcsec!.Value - alternative.RmsTotalArcsec!.Value;
-        bool significant = improvement > SignificanceSigmas * CombinedStandardError(baseline, alternative);
+        bool significant = improvement > SignificanceSigmas * CombinedStandardError(baseline, alternative, effectiveFrames);
         return new TrialVerdict(baseline, significant ? alternative : baseline, best, significant, improvement / baseline.RmsTotalArcsec.Value * 100,
             changePercent, changed);
     }
+
+    private static double? Neff(CoachTrial t, IReadOnlyDictionary<string, double>? effectiveFrames) =>
+        effectiveFrames is not null && effectiveFrames.TryGetValue(t.Id, out var n) ? n : null;
 
     private static double Sq(double v) => v * v;
 }

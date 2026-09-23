@@ -301,6 +301,134 @@ public class CoachAnalysisTests
     }
 
     [Test]
+    public void Autocorrelated_trials_with_equal_rms_rarely_produce_a_winner()
+    {
+        int winners = 0, naiveWinners = 0;
+        double rhoSum = 0;
+        for (int seed = 0; seed < 200; seed++)
+        {
+            var rng = new Random(seed);
+            var a = Ar1Trial("A", CoachTrialKinds.Current, 100, 0.7, sigma: 0.5, rng);
+            var b = Ar1Trial("B", CoachTrialKinds.Suggestion, 100, 0.7, sigma: 0.5, rng);
+            rhoSum += a.Stats.RhoRa;
+            var neff = new Dictionary<string, double> { ["A"] = a.Stats.EffectiveFrames, ["B"] = b.Stats.EffectiveFrames };
+            if (TrialJudge.Judge([a.Trial, b.Trial], neff).Significant)
+            {
+                winners++;
+            }
+
+            if (TrialJudge.Judge([a.Trial, b.Trial]).Significant)
+            {
+                naiveWinners++;
+            }
+        }
+
+        TestContext.Out.WriteLine($"mean ρ {rhoSum / 200:F2}; false winners {winners}/200 (frame-count rule: {naiveWinners}/200)");
+        winners.Should().BeLessThanOrEqualTo(10, "equal trials must produce a winner in at most 5 % of the seeds");
+        naiveWinners.Should().BeGreaterThan(winners, "ignoring the autocorrelation overstates the significance");
+    }
+
+    [Test]
+    public void A_truly_better_trial_still_wins()
+    {
+        // deterministic, uncorrelated errors (lag-1 autocorrelation ≤ 0): B has 30 % lower RMS over 100 frames
+        var pattern = new[] { 1.0, 1.0, -1.0, -1.0 };
+        List<TrialSample> Series(double amplitude) => Enumerable.Range(0, 100)
+            .Select(i => new TrialSample(i * 2.0, amplitude * pattern[i % 4], amplitude * pattern[(i + 1) % 4], 50)).ToList();
+        var sa = TrialStatistics.Compute(Series(0.5), 1.0)!;
+        var sb = TrialStatistics.Compute(Series(0.35), 1.0)!;
+        sa.EffectiveFrames.Should().BeGreaterThan(95, "hardly any autocorrelation");
+        var verdict = TrialJudge.Judge([ToTrial("A", CoachTrialKinds.Current, sa), ToTrial("B", CoachTrialKinds.Suggestion, sb)],
+            new Dictionary<string, double> { ["A"] = sa.EffectiveFrames, ["B"] = sb.EffectiveFrames });
+        verdict.Significant.Should().BeTrue();
+        verdict.Winner!.Id.Should().Be("B");
+        verdict.ImprovementPercent!.Value.Should().BeApproximately(30, 0.1);
+
+        // random independent errors: the 30 % improvement is found in most runs despite the noise of both RMS values
+        int wins = 0;
+        for (int seed = 0; seed < 200; seed++)
+        {
+            var rng = new Random(1000 + seed);
+            var a = Ar1Trial("A", CoachTrialKinds.Current, 100, 0.0, sigma: 0.5, rng);
+            var b = Ar1Trial("B", CoachTrialKinds.Suggestion, 100, 0.0, sigma: 0.35, rng);
+            if (TrialJudge.Judge([a.Trial, b.Trial], new Dictionary<string, double> { ["A"] = a.Stats.EffectiveFrames, ["B"] = b.Stats.EffectiveFrames }).Significant)
+            {
+                wins++;
+            }
+        }
+
+        TestContext.Out.WriteLine($"30 % better trial won {wins}/200 (independent frames)");
+        wins.Should().BeGreaterThanOrEqualTo(160);
+
+        // moderately correlated errors (ρ = 0.5, 120 frames): the improvement is still found in most runs (~90 %)
+        int correlatedWins = 0;
+        for (int seed = 0; seed < 200; seed++)
+        {
+            var rng = new Random(5000 + seed);
+            var a = Ar1Trial("A", CoachTrialKinds.Current, 120, 0.5, sigma: 0.5, rng);
+            var b = Ar1Trial("B", CoachTrialKinds.Suggestion, 120, 0.5, sigma: 0.35, rng);
+            if (TrialJudge.Judge([a.Trial, b.Trial], new Dictionary<string, double> { ["A"] = a.Stats.EffectiveFrames, ["B"] = b.Stats.EffectiveFrames }).Significant)
+            {
+                correlatedWins++;
+            }
+        }
+
+        TestContext.Out.WriteLine($"30 % better trial won {correlatedWins}/200 (ρ = 0.5, 120 frames)");
+        correlatedWins.Should().BeGreaterThanOrEqualTo(160);
+    }
+
+    [Test]
+    public void Effective_frames_follow_the_lag_one_autocorrelation()
+    {
+        TrialJudge.EffectiveFrames(100, 0.7).Should().BeApproximately(100 * 0.51 / 1.49, 1e-9);
+        TrialJudge.EffectiveFrames(100, -0.4).Should().Be(100, "negative autocorrelation is clamped to 0");
+        TrialJudge.EffectiveFrames(100, 0.99).Should().BeApproximately(100 * (1 - 0.9025) / 1.9025, 1e-9, "clamped to 0.95");
+        TrialJudge.LagOneAutocorrelation([1, -1, 1, -1, 1, -1]).Should().BeLessThan(-0.5);
+        var rng = new Random(3);
+        TrialJudge.LagOneAutocorrelation(Ar1(5000, 0.7, 1.0, rng)).Should().BeApproximately(0.7, 0.05);
+
+        // conditionsChanged uses the effective frames too: 33 % with strongly correlated 200-frame trials is noise
+        CoachTrial T(string id, string kind, double rms) => new() { Id = id, Kind = kind, State = CoachTrialStates.Done, RmsTotalArcsec = rms, Frames = 200 };
+        TrialJudge.Judge([T("A", "current", 0.30), T("A2", "currentRepeat", 0.40)]).ConditionsChanged.Should().BeTrue();
+        TrialJudge.Judge([T("A", "current", 0.30), T("A2", "currentRepeat", 0.40)],
+            new Dictionary<string, double> { ["A"] = TrialJudge.EffectiveFrames(200, 0.9), ["A2"] = TrialJudge.EffectiveFrames(200, 0.9) })
+            .ConditionsChanged.Should().BeFalse();
+    }
+
+    private static List<double> Ar1(int n, double rho, double sigma, Random rng)
+    {
+        double Gauss() => Math.Sqrt(-2 * Math.Log(1 - rng.NextDouble())) * Math.Cos(2 * Math.PI * rng.NextDouble());
+        var list = new List<double>(n);
+        double x = sigma * Gauss();
+        for (int i = 0; i < n; i++)
+        {
+            list.Add(x);
+            x = rho * x + Math.Sqrt(1 - rho * rho) * sigma * Gauss();
+        }
+
+        return list;
+    }
+
+    private static (CoachTrial Trial, TrialStatistics Stats) Ar1Trial(string id, string kind, int n, double rho, double sigma, Random rng)
+    {
+        var ra = Ar1(n, rho, sigma, rng);
+        var dec = Ar1(n, rho, sigma, rng);
+        var stats = TrialStatistics.Compute(Enumerable.Range(0, n).Select(i => new TrialSample(i * 2.0, ra[i], dec[i], 50)).ToList(), 1.0)!;
+        return (ToTrial(id, kind, stats), stats);
+    }
+
+    private static CoachTrial ToTrial(string id, string kind, TrialStatistics s) => new()
+    {
+        Id = id,
+        Kind = kind,
+        State = CoachTrialStates.Done,
+        Frames = s.Frames,
+        RmsTotalArcsec = s.RmsTotalArcsec,
+        RmsRaArcsec = s.RmsRaArcsec,
+        RmsDecArcsec = s.RmsDecArcsec,
+    };
+
+    [Test]
     public void Report_grade_budget_and_ranking()
     {
         CoachReportBuilder.Grade(0.4, 1.0).Grade.Should().Be(CoachGrades.Excellent);
