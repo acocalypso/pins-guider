@@ -4,6 +4,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using PinsGuider.Engine.Algorithms;
 using PinsGuider.Engine.Calibration;
+using PinsGuider.Engine.Coach;
 using PinsGuider.Engine.Core;
 using PinsGuider.Engine.Imaging;
 using PinsGuider.Engine.MultiStar;
@@ -30,7 +31,7 @@ public sealed record SettleResult(bool Success, string? Error, int TotalFrames, 
 /// (raised on the loop task — handlers must not block).
 /// </para>
 /// </summary>
-public sealed class Guider : IAsyncDisposable
+public sealed partial class Guider : IAsyncDisposable
 {
     private const string MountName = "Mount";
 
@@ -46,6 +47,9 @@ public sealed class Guider : IAsyncDisposable
     private readonly DitherPlanner ditherPlanner;
 
     private GuiderSettings settings;
+
+    // settings as set by the host; `settings` = baseSettings plus the coach's temporary overlay
+    private GuiderSettings baseSettings;
     private MultiStarTracker tracker;
     private AxisCorrector corrector;
     private GuidingStatistics stats;
@@ -102,6 +106,7 @@ public sealed class Guider : IAsyncDisposable
         this.mount = mount ?? throw new ArgumentNullException(nameof(mount));
         this.clock = clock ?? SystemClock.Instance;
         this.settings = settings ?? new GuiderSettings();
+        baseSettings = this.settings;
         Preprocessor = preprocessor ?? new FramePreprocessor();
         ditherPlanner = new DitherPlanner(ditherSeed);
 
@@ -172,6 +177,16 @@ public sealed class Guider : IAsyncDisposable
     /// <summary>Start looping exposures (PHD2 loop).</summary>
     public void StartLooping(CancellationToken externalToken = default)
     {
+        if (!IsLoopRunning)
+        {
+            InterruptCoach(CoachInterruptReasons.Guiding);
+        }
+
+        StartLoopingCore(externalToken);
+    }
+
+    private void StartLoopingCore(CancellationToken externalToken)
+    {
         Post(() =>
         {
             if (state is GuiderState.Stopped or GuiderState.Failed)
@@ -184,7 +199,13 @@ public sealed class Guider : IAsyncDisposable
     }
 
     /// <summary>Stop capturing (PHD2 stop_capture). Guiding stops too.</summary>
-    public async Task StopCaptureAsync()
+    public Task StopCaptureAsync()
+    {
+        InterruptCoach(CoachInterruptReasons.Stopped);
+        return StopCaptureCoreAsync();
+    }
+
+    private async Task StopCaptureCoreAsync()
     {
         Task? t;
         lock (loopLock)
@@ -217,9 +238,10 @@ public sealed class Guider : IAsyncDisposable
     /// <summary>Select the best star on the next frame (PHD2 find_star).</summary>
     public void AutoSelectStar()
     {
+        InterruptCoach(CoachInterruptReasons.Guiding);
         Post(() =>
         {
-            if (state.IsGuidingActive() || state == GuiderState.Calibrating)
+            if (state.IsGuidingActive() || state == GuiderState.Calibrating || coachHook is not null)
             {
                 // the guide star cannot be changed while guiding
                 return;
@@ -240,6 +262,13 @@ public sealed class Guider : IAsyncDisposable
     /// and completes once settled.
     /// </summary>
     public Task<SettleResult> StartGuidingAsync(SettleParams settleParams, bool forceCalibration = false, CancellationToken ct = default)
+    {
+        InterruptCoach(CoachInterruptReasons.Guiding);
+        return StartGuidingCoreAsync(settleParams, forceCalibration, ct, default, forceLoop: false);
+    }
+
+    private Task<SettleResult> StartGuidingCoreAsync(SettleParams settleParams, bool forceCalibration, CancellationToken ct, CancellationToken loopToken,
+        bool forceLoop)
     {
         var op = new PendingOperation(PendingKind.Guide, settleParams, ct);
         Post(() =>
@@ -273,16 +302,21 @@ public sealed class Guider : IAsyncDisposable
                 autoSelectAttemptsLeft = Math.Max(1, settings.AutoSelectAttempts);
             }
         });
-        EnsureLoop();
+        EnsureLoop(loopToken, force: forceLoop);
         return op.Task;
     }
 
     /// <summary>Stop guiding but keep looping with the star selected.</summary>
-    public void StopGuiding() => Post(() => StopGuidingCore(GuiderState.Selected));
+    public void StopGuiding()
+    {
+        InterruptCoach(CoachInterruptReasons.Guiding);
+        Post(() => StopGuidingCore(GuiderState.Selected));
+    }
 
     /// <summary>Dither by up to <paramref name="amountPx"/> pixels (PHD2 dither); completes when settled.</summary>
     public Task<SettleResult> DitherAsync(double amountPx, bool raOnly, SettleParams settleParams, CancellationToken ct = default)
     {
+        InterruptCoach(CoachInterruptReasons.Dither);
         var op = new PendingOperation(PendingKind.Dither, settleParams, ct);
         Post(() => DitherCore(amountPx, raOnly, op));
         if (!IsLoopRunning && AutoStartLoop)
@@ -294,7 +328,13 @@ public sealed class Guider : IAsyncDisposable
     }
 
     /// <summary>Pause guiding (PHD2 set_paused). <paramref name="full"/> also stops exposures.</summary>
-    public void Pause(bool full = false) => Post(() =>
+    public void Pause(bool full = false)
+    {
+        InterruptCoach(CoachInterruptReasons.Guiding);
+        PauseCore(full);
+    }
+
+    private void PauseCore(bool full) => Post(() =>
     {
         if (!state.IsGuidingActive())
         {
@@ -312,7 +352,13 @@ public sealed class Guider : IAsyncDisposable
     });
 
     /// <summary>Resume after <see cref="Pause"/> or after an auto-pause that requires an explicit resume.</summary>
-    public void Resume() => Post(() =>
+    public void Resume()
+    {
+        InterruptCoach(CoachInterruptReasons.Guiding);
+        ResumeCommand();
+    }
+
+    private void ResumeCommand() => Post(() =>
     {
         fullPause = false;
         userPaused = false;
@@ -359,7 +405,13 @@ public sealed class Guider : IAsyncDisposable
     }
 
     /// <summary>Forget the calibration (PHD2 clear_calibration).</summary>
-    public void ClearCalibration() => Post(() =>
+    public void ClearCalibration()
+    {
+        InterruptCoach(CoachInterruptReasons.Guiding);
+        ClearCalibrationCommand();
+    }
+
+    private void ClearCalibrationCommand() => Post(() =>
     {
         if (state.IsGuidingActive() || state == GuiderState.Calibrating)
         {
@@ -398,7 +450,13 @@ public sealed class Guider : IAsyncDisposable
     }
 
     /// <summary>Set the lock position explicitly (PHD2 set_lock_position).</summary>
-    public void SetLockPosition(GuidePoint position) => Post(() =>
+    public void SetLockPosition(GuidePoint position)
+    {
+        InterruptCoach(CoachInterruptReasons.Guiding);
+        SetLockPositionCommand(position);
+    }
+
+    private void SetLockPositionCommand(GuidePoint position) => Post(() =>
     {
         if (frameWidth > 0 && !tracker.IsValidLockPosition(position))
         {
@@ -413,7 +471,11 @@ public sealed class Guider : IAsyncDisposable
     public void UpdateSettings(GuiderSettings newSettings)
     {
         ArgumentNullException.ThrowIfNull(newSettings);
-        Post(() => ApplySettings(newSettings));
+        Post(() =>
+        {
+            baseSettings = newSettings;
+            ApplySettings(ComposeSettings());
+        });
         if (!IsLoopRunning)
         {
             DrainCommands();
@@ -438,8 +500,23 @@ public sealed class Guider : IAsyncDisposable
 
         lock (loopLock)
         {
+            if (cameraLeased)
+            {
+                // the coach is using the camera outside the loop: start once it releases the camera
+                deferredLoopStart = true;
+                deferredLoopToken = externalToken.CanBeCanceled ? externalToken : deferredLoopToken;
+                return;
+            }
+
             if (loopTask is { IsCompleted: false })
             {
+                if (force)
+                {
+                    // the loop may be finishing: make sure a forced (coach) start is not lost
+                    forcedRestart = true;
+                    forcedRestartToken = externalToken;
+                }
+
                 return;
             }
 
@@ -452,9 +529,19 @@ public sealed class Guider : IAsyncDisposable
             // commands posted while the loop was finishing would otherwise wait for the next start
             task.ContinueWith(_ =>
             {
-                if (!commands.IsEmpty && AutoStartLoop)
+                bool restart;
+                CancellationToken token;
+                lock (loopLock)
                 {
-                    EnsureLoop();
+                    restart = forcedRestart;
+                    token = forcedRestartToken;
+                    forcedRestart = false;
+                    forcedRestartToken = default;
+                }
+
+                if (!commands.IsEmpty && (AutoStartLoop || restart))
+                {
+                    EnsureLoop(token, force: restart);
                 }
             }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
         }
@@ -475,10 +562,13 @@ public sealed class Guider : IAsyncDisposable
         {
             a();
         }
+
+        DrainPublishedEvents();
     }
 
     private async Task LoopAsync(CancellationToken ct)
     {
+        coachFailureHandled = false;
         try
         {
             while (!ct.IsCancellationRequested)
@@ -558,8 +648,10 @@ public sealed class Guider : IAsyncDisposable
             calibrationProcess = null;
             ClearRequests();
             CompletePending(SettleResult.Failed(state == GuiderState.Failed ? lastError?.Code ?? GuideErrorCode.Internal : GuideErrorCode.None, "guiding stopped"));
+            OnLoopEndedForCoach();
             FlushEvents();
             Emit(new LoopingExposuresStoppedEvent(clock.UtcNow));
+            DrainPublishedEvents();
         }
     }
 
@@ -614,6 +706,7 @@ public sealed class Guider : IAsyncDisposable
         }
         finally
         {
+            DrainPublishedEvents();
             deferEvents = false;
             FlushEvents();
         }
@@ -930,6 +1023,7 @@ public sealed class Guider : IAsyncDisposable
         corrector.SetGuidingEnabled(true, now);
         stats.Start(now);
         guideStart = now;
+        ResetLiveHints();
         ditherPlanner.ResetSpiral();
         SetLockPositionCore(starPosition);
         SetState(GuiderState.Guiding);
@@ -973,7 +1067,10 @@ public sealed class Guider : IAsyncDisposable
         pulses = [];
         bool paused = state == GuiderState.Paused || autoPaused;
         bool raOnly = corrector.DecGuideMode == DecGuideMode.Off;
-        var ts = new TrackerState(IsGuiding: true, IsSettling: settle.IsActive, IsPaused: paused, RaOnly: raOnly, GuidingEnabled: !paused);
+        bool measuring = IsCoachMeasuring;
+
+        // measurements track the primary alone (like PHD2's guiding assistant disables multi-star)
+        var ts = new TrackerState(IsGuiding: true, IsSettling: settle.IsActive, IsPaused: paused, RaOnly: raOnly, GuidingEnabled: !paused && !measuring);
         var r = tracker.ProcessFrame(frame, lockPosition, ts, now);
         if (transform is not { } t)
         {
@@ -1005,6 +1102,12 @@ public sealed class Guider : IAsyncDisposable
             }
 
             var mountOfs = t.CameraToMount(r.CameraOffset);
+            if (measuring)
+            {
+                // guiding output is off: no corrections, statistics or safety monitors
+                pulses = CoachMeasurementFrame(frame, r, t, mountOfs, snapshot, now, sw, raOnly);
+                return r;
+            }
 
             // judge the previous frame's large pulse
             if (response.Evaluate(mountOfs.X, mountOfs.Y))
@@ -1100,6 +1203,10 @@ public sealed class Guider : IAsyncDisposable
                 pulses = corrPulses;
                 stats.Add(GuideStepSample.FromCorrection(corr, now, r.Primary.Snr, r.StarsUsed, excluded: settle.IsActive || recenterMove));
                 lastStats = stats.GetSnapshot(now);
+                if (!settle.IsActive && !recenterMove)
+                {
+                    UpdateLiveHints(corr, r, now);
+                }
             }
 
             Emit(new GuideStepEvent(now)
@@ -1140,6 +1247,8 @@ public sealed class Guider : IAsyncDisposable
                 Emit(new AlertEvent(now, GuideErrorCode.PrimaryEstimatedFromSecondaries, GuideErrorSeverity.Info,
                     GuideErrorCatalog.Get(GuideErrorCode.PrimaryEstimatedFromSecondaries).Title));
             }
+
+            CoachObserveFrame(frame, r, t, mountOfs, snapshot, now, corr, recenterMove);
         }
         else if (r.Outcome == TrackerOutcome.JumpRejected)
         {
@@ -1153,6 +1262,8 @@ public sealed class Guider : IAsyncDisposable
             {
                 return r;
             }
+
+            CoachStarLostFrame(frame, r, t, snapshot, now);
         }
 
         UpdateSettle(now, raOnly);
@@ -1263,6 +1374,7 @@ public sealed class Guider : IAsyncDisposable
 
         var inverted = CalibrationAdjuster.InvertDec(calibration);
         settings = settings with { DecFlipRequired = !settings.DecFlipRequired };
+        baseSettings = baseSettings with { DecFlipRequired = settings.DecFlipRequired };
         UseCalibration(adjustment with { Calibration = inverted });
         decFlip.Reset();
         flipInverted = true;
@@ -1321,6 +1433,12 @@ public sealed class Guider : IAsyncDisposable
         if (state is not (GuiderState.Guiding or GuiderState.LostLock or GuiderState.Reacquiring) || transform is null)
         {
             op.Complete(SettleResult.Failed(GuideErrorCode.DitherFailed, "cannot dither if not guiding"));
+            return;
+        }
+
+        if (IsCoachMeasuring)
+        {
+            op.Complete(SettleResult.Failed(GuideErrorCode.DitherFailed, "cannot dither during a Guiding Coach measurement"));
             return;
         }
 
@@ -1407,6 +1525,11 @@ public sealed class Guider : IAsyncDisposable
     private void HandleMountState(MountSnapshot snapshot)
     {
         var reason = mountWatch.Update(snapshot);
+        if (reason != MountPauseReason.None)
+        {
+            InterruptCoachOnLoop(reason == MountPauseReason.Disconnected ? CoachInterruptReasons.Disconnect : CoachInterruptReasons.Slew);
+        }
+
         if (!(state.IsGuidingActive() || state == GuiderState.Calibrating))
         {
             return;
@@ -1528,6 +1651,12 @@ public sealed class Guider : IAsyncDisposable
         {
             DecGuideMode = s.DecGuideMode,
         };
+        if (IsCoachMeasuring)
+        {
+            // a new corrector starts with output enabled: keep it off during a coach measurement
+            newCorrector.SetGuidingEnabled(false, clock.UtcNow);
+        }
+
         corrector = newCorrector;
 
         ditherPlanner.Mode = s.DitherMode;
@@ -1618,6 +1747,7 @@ public sealed class Guider : IAsyncDisposable
 
     private void Fail(GuideErrorCode code, string? detail = null)
     {
+        OnGuiderFailedForCoach(code);
         Alert(code, detail);
         if (state.IsGuidingActive() || state == GuiderState.Calibrating)
         {

@@ -85,6 +85,9 @@ public sealed record GuideStepEvent(DateTimeOffset Timestamp) : GuiderEvent(Time
     public IReadOnlyList<StarInfo> Stars { get; init; } = [];
 
     public double ProcessingMs { get; init; }
+
+    /// <summary>Guiding Coach measurement frame: guiding output off, excluded from statistics (no correction fields).</summary>
+    public bool CoachMeasurement { get; init; }
 }
 
 public sealed record StarLostEvent(DateTimeOffset Timestamp, long Frame, double Time, double StarMass, double Snr, double Hfd, double AvgDist, int ErrorCode, string Status)

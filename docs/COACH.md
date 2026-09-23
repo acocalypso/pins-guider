@@ -56,11 +56,11 @@ Samples mount-axis star positions (calibration transform) every frame for `Drift
   (dec unknown → assume 0, parameter `decAssumed`).
 * **Drift-limiting exposure**: longest exposure for which RA drift during an exposure stays below the
   seeing RMS.
-* **Wind/gusts**: fraction of frame-to-frame jumps > 4 σ of the high-frequency jitter.
+* **Wind/gusts**: share (percent) of frame-to-frame jumps > 4 σ of the high-frequency jitter.
 
 Findings: `drift.seeing` {rms, level good|average|poor}, `drift.periodicError` {amplitude, period},
 `drift.raRate` {maxRate}, `drift.polarAlignment` {arcmin, decAssumed}, `drift.exposureLimit` {seconds},
-`drift.wind` {fraction}.
+`drift.wind` {gustPercent}.
 
 ### 2.3 MountResponse (pulses, guiding output off)
 * **Dec backlash**, own method (fixes PHD2's low bias and edge cases): clear backlash northwards until
@@ -122,11 +122,23 @@ lower RA aggression), `hint.raSluggish` (index < 0.15 with large RMS → raise a
 
 ## 6. Contract
 
-`IAdvancedGuider` (pins `NINA.Equipment/Interfaces/IAdvancedGuider.cs`): `StartCoach(options)` (true = accepted and
-running in the background; false = rejected, `Phase=Failed` + `Message`/`MessageCode`), `SkipCoachStep`,
-`CancelCoach`, `GetCoachStatus`, `ApplyCoachActions(ids)` (finding ids or `trial:<id>`), `GetCoachHistory(max)`,
-`DismissHint(id)`; `AdvancedGuiderStatus.Hints` / `CoachRunning`; events `coach` (AdvancedCoachStatus) and `hint`
-(AdvancedCoachFinding). The engine mirrors these DTOs in `PinsGuider.Engine.Coach`; the plugin maps them 1:1.
+`IAdvancedGuider` (pins `NINA.Equipment/Interfaces/IAdvancedGuider.cs`): `StartCoach(options)` returns
+`AdvancedCoachStartResult { Accepted, Message, MessageCode, MessageParameters, Status }` — a rejection is reported only in
+the result and never modifies the status of a running or the last session; `SkipCoachStep`, `CancelCoach`,
+`GetCoachStatus`, `ApplyCoachActions(ids)` (finding ids, `trial:<id>` or ids of active live hints — an applied hint is
+dismissed), `GetCoachHistory(max)` (reports of the active profile; each report keeps its `ProfileName`), `DismissHint(id)`;
+`AdvancedGuiderStatus.Hints` / `CoachRunning`; events `coach` (AdvancedCoachStatus) and `hint` (AdvancedCoachFinding). The
+engine mirrors these DTOs in `PinsGuider.Engine.Coach`; the plugin maps them 1:1.
+
+Codes with parameters: status and step status carry `MessageCode` + `MessageParameters` (e.g. `coach.interrupted`
+{reason}); each step carries an English `Detail` (logs) plus `DetailCode` + `DetailParameters` for the UI:
+`camera.combination` {exposureSeconds, gain, index, total}, `calibrating`, `drift.measuring`, `response.backlash`,
+`response.pulses` {direction, ms}, `trial.settling` {id}, `trial.running` {id}; null when none.
+
+Periodic error model (AdvancedCoachDrift, only when a period was found), on the RA samples (arcsec, relative to the first
+sample, T = sample time in s): `Ra(T) = PeriodicErrorOffsetArcsec + RaDriftArcsecPerMin·T/60 +
+PeriodicErrorAmplitudeArcsec·sin(2πT/PeriodicErrorPeriodSeconds + PeriodicErrorPhaseRad)`. Without a period the amplitude
+is half the peak-to-peak of the detrended, smoothed RA motion. `GustPercent` is 0..100.
 
 Session rules:
 * Accepted from Stopped/Looping/Selected/Guiding/Paused; rejected while calibrating, building darks, disconnected or
@@ -164,7 +176,7 @@ Severity in brackets; `→` = setting changes carried in `Changes`. Parameter un
 | drift.periodicError | info/warning | amplitudeArcsec, periodSeconds (null if unknown), maxRateArcsecPerSec | worm PE; PEC, shorter exposure |
 | drift.exposureLimit | good/warning | seconds, currentSeconds | exposure longer than the RA drift allows → ExposureSeconds |
 | drift.polarAlignment | good/info/warning/problem (<3′/<5′/<10′/≥10′) | arcmin, decAssumed, driftArcsecPerMin | polar alignment |
-| drift.wind | warning | fraction | gusts/vibration; shield the scope, avoid chasing (higher min-move) |
+| drift.wind | warning | gustPercent | gusts/vibration; shield the scope, avoid chasing (higher min-move) |
 | drift.decGuideMode | info | mode (North\|South), driftArcsecPerMin, backlashMs | one-sided Dec guiding avoids backlash → DecGuideMode |
 | response.decBacklash | good/info/warning | ms, arcsec | Dec backlash → BacklashCompensation, BacklashPulseMs; or mechanical fix / slight Dec imbalance |
 | response.minPulse | warning | axis (Ra\|Dec), ms | pulses shorter than this don't move the mount (stiction) → min-move above it |
@@ -183,3 +195,25 @@ Severity in brackets; `→` = setting changes carried in `Changes`. Parameter un
 | hint.lowSnr | warning | snr | star SNR dropped (clouds, dew) |
 | hint.decDrift | info | driftArcsecPerMin, arcmin | Dec corrections one-sided → polar alignment / DecGuideMode |
 | hint.seeingBound | good | rmsArcsec | RMS near the seeing floor: nothing to tune |
+
+## 8. Engine implementation notes
+
+* **API** (`PinsGuider.Engine.Coach`): `GuidingCoach(Guider, ICoachHost)` with `Start`, `SkipStep`, `Cancel`, `Status`,
+  `ApplyActions`, `GetHistory`, `IsRunning`, `Completion`; status updates as `CoachStatusEvent`, hints as `CoachHintEvent`
+  through `Guider.EventRaised` (delivered by the guide loop behind the pulses). `Guider.ActiveHints` / `DismissHint`.
+* **Temporary settings** are an overlay on top of the host settings (`CoachSettingsMap` maps the plugin setting names);
+  host `UpdateSettings` keeps working during a session and every exit path simply drops the overlay.
+* **Measurements** run in the guide loop as frame hooks: guiding output off, single-star tracking, frames kept out of the
+  statistics and safety monitors, hook pulses issued through the normal pulse path and clamped to the max pulse. The camera
+  check captures outside the loop with the camera leased; a loop start meanwhile interrupts the session and starts after
+  the camera is released.
+* **Seeing** is the high-frequency RMS about a centred moving average over max(6 s, 3 × exposure) (no phase lag, drift and
+  slow PE removed; corrected for the average's own noise share).
+* **Backlash**: North pulses until two consecutive moves agree (≥ 40 % of the calibrated move), then South pulses; once three
+  South moves in a row are substantial and the last two agree, the last two pulses moved at the full South rate r and the
+  dead band is D = k·P − (y′₀ − y′ₖ)/r (averaged over two points, drift-corrected). No PHD2 low bias; asymmetric Dec rates
+  are handled (D is South pulse time).
+* **Interrupts**: host guiding commands (start/stop guiding, pause/resume, dither, star selection, lock position, clear
+  calibration, loop start/stop), mount slews/park/disconnect, camera failure and loop end cancel the session with
+  `coach.interrupted` {reason}; the guider state is then left to the host. A runaway or unresponsive mount during a trial
+  fails only that trial. Cancel and normal end resume guiding with the original settings when it was active at the start.
