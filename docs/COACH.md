@@ -42,12 +42,15 @@ saturated, SNR ≥ 15, star found. Recommended = lowest jitter; within 10 % pref
 exposure. The recommended exposure/gain are used (temporarily) for the following steps.
 
 Findings (examples): `camera.recommendation` {exposure, gain, jitter, snr, stars}, `camera.snrLow` {snr,
-noiseArcsec}, `camera.saturated` {exposure, gain}, `camera.defocused` {hfd} (HFD > 5 px or > 3″),
+noiseArcsec}, `camera.saturated` {exposure, gain}, `camera.defocused` {hfd} (HFD > 4 px **and** > 5″: undersampled
+guide scopes at ≥ 3″/px show ~2 px ≈ 6″ in perfect focus, finely sampled ones many px for a normal star),
 `camera.fewStars` {stars} (< 3: multi-star can't help), `camera.noDarks` (no dark library loaded; hot pixels),
 `camera.good`.
 
 ### 2.2 Drift (guiding output off)
-Samples mount-axis star positions (calibration transform) every frame for `DriftSeconds`.
+Samples mount-axis star positions (calibration transform) every frame for `DriftSeconds`. The position is the
+multi-star combined position (SNR-weighted mean displacement of the guide stars, as the guider's multi-star offset), so
+seeing and drift are measured with the same averaging as the guided RMS and the error budget adds up.
 * **Seeing** = high-frequency RMS per axis (high-pass, cutoff ~ max(6 s, 3 × exposure)).
 * **RA periodic error**: detrend, then least-squares sinusoid scan over periods 60–1200 s (only report a
   period when the run covers ≥ 1.2 periods; otherwise peak-to-peak and max rate only). Amplitude, period,
@@ -67,9 +70,14 @@ Findings: `drift.seeing` {rms, level good|average|poor}, `drift.periodicError` {
   consecutive moves are consistent, then reverse to south with fixed pulses and measure the pulse time
   spent before the star moves at the calibrated rate again (dead band = consumed ms). Report ms and ″.
 * **Pulse response**: for each direction (E, W, N, S) pulses of 100/250/500/1000 ms (capped at max pulse)
-  twice; measured move vs expected (calibration rate). Yields the **minimum effective pulse** (smallest
-  pulse reaching ≥ 50 % of the expected move), **asymmetry** (W vs E, N vs S ratio) and **rate mismatch**
-  (measured/calibrated rate).
+  twice; the move is measured between the mean of 3 frames before and 3 frames after each pulse (drift-corrected)
+  and compared with the expected move (calibration rate). Noise-aware: σ of a measured move comes from the drift
+  step's seeing (else from the scatter within the averaging windows); a duration is only judged when its expected
+  move is ≥ 3 σ of the (mean) measurement, otherwise it is inconclusive and produces no finding. Yields the **minimum
+  effective pulse** (smallest conclusively effective duration, i.e. ≥ 50 % of the expected move), **stiction** (only
+  when a shorter duration was conclusively ineffective, < 50 %), **asymmetry** (W vs E, N vs S ratio) and **rate
+  mismatch** (measured/calibrated rate). The min-move suggested for stiction is the effective pulse at the calibrated
+  rate, capped at max(2 × the seeing-based min-move, 0.6 px).
 
 Findings: `response.decBacklash` {ms, arcsec}, `response.minPulse` {axis, ms}, `response.asymmetry`
 {axis, ratio}, `response.rateMismatch` {axis, ratio}, `response.good`.
@@ -85,9 +93,12 @@ Candidate settings sets derived from the previous steps:
   ±0.15 or the alternative exposure);
 * **A′ – current again** (optional `RepeatBaseline`, default on) to detect changing conditions.
 Each trial: apply temporarily, settle (tolerance from the profile, max 30 s), then guide `TrialSeconds`,
-measure RMS RA/Dec/total, peak, oscillation index, frames. Winner = lowest total RMS; if A and A′ differ by
-> 25 % a `trials.conditionsChanged` finding warns that the comparison is unreliable. Settings are restored
-at the end (the user applies the winner explicitly).
+measure RMS RA/Dec/total, peak, oscillation index, frames. Significance: the standard error of a trial's RMS is
+≈ RMS/√(2N) for N frames. The best alternative (B or C) is declared `trials.winner` only if its improvement over A
+exceeds 2 × the combined standard error of the two RMS values; otherwise `trials.noImprovement` (the current settings
+are as good as the alternatives within the noise; B and C stay applicable as `trial:<id>`). If A and A′ differ by
+> 25 % **and** by more than 2 combined standard errors, a `trials.conditionsChanged` finding warns that the comparison
+is unreliable. Settings are restored at the end (the user applies the winner explicitly).
 
 Findings: `trials.winner` {id, rms, improvement}, `trials.conditionsChanged` {change}, `trials.noImprovement`.
 
@@ -168,7 +179,7 @@ Severity in brackets; `→` = setting changes carried in `Changes`. Parameter un
 | camera.noFeasible | problem | reason (saturated\|lowSnr\|noStar) | no combination gave an unsaturated star with SNR ≥ 15 |
 | camera.snrLow | warning | snr, noiseArcsec | best SNR < 25: centroid noise adds to the RMS; longer exposure, higher gain, darks, focus |
 | camera.saturated | warning | exposureSeconds, gain | current settings saturate the guide star (centroid bias) → lower gain/exposure |
-| camera.defocused | warning | hfdPx, hfdArcsec | HFD > 5 px or > 3″ → focus the guide camera |
+| camera.defocused | warning | hfdPx, hfdArcsec | HFD > 4 px and > 5″ → focus the guide camera |
 | camera.fewStars | info | stars | < 3 usable stars: multi-star can't average seeing; longer exposure / different field |
 | camera.noDarks | info | — | no dark library: hot pixels can be mistaken for stars; build darks |
 | drift.seeing | good/info/warning | rmsArcsec, level (good\|average\|poor) | seeing floor; guiding can't beat it |
@@ -179,13 +190,13 @@ Severity in brackets; `→` = setting changes carried in `Changes`. Parameter un
 | drift.wind | warning | gustPercent | gusts/vibration; shield the scope, avoid chasing (higher min-move) |
 | drift.decGuideMode | info | mode (North\|South), driftArcsecPerMin, backlashMs | one-sided Dec guiding avoids backlash → DecGuideMode |
 | response.decBacklash | good/info/warning | ms, arcsec | Dec backlash → BacklashCompensation, BacklashPulseMs; or mechanical fix / slight Dec imbalance |
-| response.minPulse | warning | axis (Ra\|Dec), ms | pulses shorter than this don't move the mount (stiction) → min-move above it |
+| response.minPulse | warning | axis (Ra\|Dec), ms | shorter pulses were conclusively ineffective (expected move ≥ 3 σ, moved < 50 %): stiction → min-move above it (capped at max(2 × seeing min-move, 0.6 px)) |
 | response.asymmetry | warning | axis, ratio | one direction moves much more (balance, gear mesh, guide rate) |
 | response.rateMismatch | warning | axis, ratio | measured rate ≠ calibration → recalibrate |
 | response.good | good | — | mount responds cleanly |
-| trials.winner | good/info | id, rmsArcsec, baselineRmsArcsec, improvementPercent | best set; → its settings |
-| trials.noImprovement | good | rmsArcsec | current settings are already the best |
-| trials.conditionsChanged | warning | changePercent | baseline changed > 25 %: comparison unreliable |
+| trials.winner | good/info | id, rmsArcsec, baselineRmsArcsec, improvementPercent | best set, better than A by > 2 combined standard errors; → its settings |
+| trials.noImprovement | good | rmsArcsec | current settings are as good as the alternatives within the noise |
+| trials.conditionsChanged | warning | changePercent | baseline changed > 25 % and > 2 combined standard errors: comparison unreliable |
 | report.seeingLimited | good | seeingArcsec, guidedArcsec | seeing dominates: settings are fine |
 | report.mountLimited | warning | mountArcsec, guidedArcsec | mount part dominates: see mount findings |
 | report.noImagingScale | info | — | set camera pixel size and telescope focal length for a grade relative to the image scale |
@@ -203,8 +214,9 @@ Severity in brackets; `→` = setting changes carried in `Changes`. Parameter un
   through `Guider.EventRaised` (delivered by the guide loop behind the pulses). `Guider.ActiveHints` / `DismissHint`.
 * **Temporary settings** are an overlay on top of the host settings (`CoachSettingsMap` maps the plugin setting names);
   host `UpdateSettings` keeps working during a session and every exit path simply drops the overlay.
-* **Measurements** run in the guide loop as frame hooks: guiding output off, single-star tracking, frames kept out of the
-  statistics and safety monitors, hook pulses issued through the normal pulse path and clamped to the max pulse. The camera
+* **Measurements** run in the guide loop as frame hooks: guiding output off, frames kept out of the statistics and safety
+  monitors, positions from a multi-star combined meter (SNR-weighted mean displacement of the guide stars from their positions
+  at the start; no stabilisation/excursion gates, which are made for guiding near the lock position), hook pulses issued through the normal pulse path and clamped to the max pulse. The camera
   check captures outside the loop with the camera leased; a loop start meanwhile interrupts the session and starts after
   the camera is released.
 * **Seeing** is the high-frequency RMS about a centred moving average over max(6 s, 3 × exposure) (no phase lag, drift and
