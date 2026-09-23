@@ -45,6 +45,30 @@ public class SimulatedCameraTests
     }
 
     [Test]
+    public async Task Gain_amplifies_the_signal_and_is_reported_through_the_gain_range()
+    {
+        var sim = new Simulator(Clean() with { Sky = new SkySimConfig { Stars = [] } });
+        IGainRange range = sim.Camera;
+        range.GainMin.Should().Be(0);
+        range.GainMax.Should().Be(100);
+        range.CurrentGain.Should().Be(0);
+
+        var low = await sim.Camera.CaptureAsync(new CaptureRequest(1000, Gain: 0), default);
+        var high = await sim.Camera.CaptureAsync(new CaptureRequest(1000, Gain: 100), default);
+        range.CurrentGain.Should().Be(100);
+        await sim.Camera.CaptureAsync(new CaptureRequest(1000), default);
+        range.CurrentGain.Should().Be(100, "a request without a gain keeps the current one");
+        await sim.Camera.CaptureAsync(new CaptureRequest(1000, Gain: 500), default);
+        range.CurrentGain.Should().Be(100, "requests are clamped to the range");
+
+        var all = new IntRect(0, 0, low.Width, low.Height);
+        double bias = sim.Camera.Config.BiasAdu;
+        double lowSignal = FrameStats(low, all).Mean - bias;
+        double highSignal = FrameStats(high, all).Mean - bias;
+        (highSignal / lowSignal).Should().BeApproximately(10.0, 0.2, "gain 100 amplifies 10x with the default model");
+    }
+
+    [Test]
     public void Background_mean_and_noise_match_the_sensor_model()
     {
         var cfg = new CameraSimConfig { HotPixelCount = 0, ColdPixelCount = 0, SkyBackgroundElectronsPerSec = 40, GainElectronsPerAdu = 0.5, BiasAdu = 500 };

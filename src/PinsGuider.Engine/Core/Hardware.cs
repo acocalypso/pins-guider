@@ -35,6 +35,20 @@ public interface ICameraSource
     Task ReconnectAsync(CancellationToken ct);
 }
 
+/// <summary>
+/// Optional capability of an <see cref="ICameraSource"/>: the camera's gain range and current gain, for gain
+/// selection in UIs and the settings sweep. Values are in the camera's native gain units; null when unknown.
+/// </summary>
+public interface IGainRange
+{
+    int? GainMin { get; }
+
+    int? GainMax { get; }
+
+    /// <summary>Gain the camera currently uses (e.g. the driver value or the last requested gain).</summary>
+    int? CurrentGain { get; }
+}
+
 public sealed class GuideCameraException(string message, Exception? inner = null) : Exception(message, inner);
 
 /// <summary>Where guide corrections are sent (mount pulse guide, camera ST4, guide port...).</summary>

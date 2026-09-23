@@ -159,7 +159,23 @@ public sealed record CameraSimConfig
     /// <summary>Mirror image (odd parity): the North direction is flipped relative to East.</summary>
     public bool Mirrored { get; init; }
 
+    /// <summary>Conversion gain in electrons per ADU at gain 0 (see <see cref="GainUnitsPerDecade"/>).</summary>
     public double GainElectronsPerAdu { get; init; } = 1.0;
+
+    /// <summary>Lowest gain setting (native units) reported through <see cref="Core.IGainRange"/>.</summary>
+    public int GainMin { get; init; }
+
+    /// <summary>Highest gain setting reported through <see cref="Core.IGainRange"/>.</summary>
+    public int GainMax { get; init; } = 100;
+
+    /// <summary>Gain used until a capture request asks for another one.</summary>
+    public int DefaultGain { get; init; }
+
+    /// <summary>
+    /// Gain units per factor 10 of amplification: electrons per ADU = <see cref="GainElectronsPerAdu"/> /
+    /// 10^(gain / GainUnitsPerDecade). With the defaults gain 100 amplifies 10×. Read noise (electrons) does not change.
+    /// </summary>
+    public double GainUnitsPerDecade { get; init; } = 100.0;
 
     public double ReadNoiseElectrons { get; init; } = 3.5;
 

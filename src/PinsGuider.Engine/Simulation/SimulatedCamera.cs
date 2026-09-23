@@ -50,11 +50,12 @@ public enum CaptureFault
 /// Image model per binned pixel in electrons: sky + dark current (×b²) + stars (Moffat PSF, flux
 /// normalised to the rendered window, motion over the exposure integrated with up to
 /// <see cref="CameraSimConfig.MaxMotionSubSamples"/> PSF copies), then Poisson shot noise and Gaussian
-/// read noise, converted with gain, bias added, fixed hot/cold pixels applied and clamped to
+/// read noise, converted to ADU with the conversion gain of the requested gain setting (see
+/// <see cref="CameraSimConfig.GainUnitsPerDecade"/>), bias added, fixed hot/cold pixels applied and clamped to
 /// <see cref="MaxAdu"/>. Noise is seeded per (seed, frame, row), so frames are reproducible.
 /// </para>
 /// </remarks>
-public sealed class SimulatedCamera : ICameraSource
+public sealed class SimulatedCamera : ICameraSource, IGainRange
 {
     private readonly object renderGate = new();
     private readonly object faultGate = new();
@@ -69,6 +70,7 @@ public sealed class SimulatedCamera : ICameraSource
     private long frameCounter;
     private CancellationTokenSource? currentCapture;
     private volatile FrameTruth? lastTruth;
+    private int currentGain;
 
     public SimulatedCamera(CameraSimConfig config, SimulatedSky sky, SimulatedMount mount, IClock clock)
     {
@@ -79,6 +81,7 @@ public sealed class SimulatedCamera : ICameraSource
         cosT = Math.Cos(config.CameraAngleDeg * Math.PI / 180.0);
         sinT = Math.Sin(config.CameraAngleDeg * Math.PI / 180.0);
         MaxAdu = (ushort)Math.Min(config.MaxAdu, (1 << Math.Clamp(config.BitsPerPixel, 8, 16)) - 1);
+        currentGain = ClampGain(config.DefaultGain);
 
         var rng = new SimRng((ulong)config.DefectSeed, 0xDEFEC7UL);
         hotPixels = new (int, int, ushort)[Math.Max(0, config.HotPixelCount)];
@@ -119,6 +122,13 @@ public sealed class SimulatedCamera : ICameraSource
 
     public int BitsPerPixel => Config.BitsPerPixel;
 
+    public int? GainMin => Config.GainMin;
+
+    public int? GainMax => Config.GainMax;
+
+    /// <summary>Gain of the last capture (or <see cref="CameraSimConfig.DefaultGain"/>); requests without a gain keep it.</summary>
+    public int? CurrentGain => Volatile.Read(ref currentGain);
+
     /// <summary>Unbinned image scale, arcsec/px.</summary>
     public double PixelScale => Config.PixelScale;
 
@@ -153,6 +163,8 @@ public sealed class SimulatedCamera : ICameraSource
         int bin = Math.Max(1, request.Binning);
         if (bin > MaxBinning) throw new GuideCameraException($"binning {bin} not supported (max {MaxBinning})");
 
+        int gain = request.Gain is { } g ? ClampGain(g) : Volatile.Read(ref currentGain);
+        Volatile.Write(ref currentGain, gain);
         long frameNo = Interlocked.Increment(ref frameCounter);
         double t0 = clock.NowSeconds();
         var startTime = clock.UtcNow;
@@ -177,7 +189,7 @@ public sealed class SimulatedCamera : ICameraSource
                 throw new GuideCameraException("simulated camera disconnected");
             }
 
-            var frame = Render(t0, expMs, bin, request.Subframe, frameNo, request.Offset);
+            var frame = Render(t0, expMs, bin, request.Subframe, frameNo, request.Offset, gain);
             frame.StartTime = startTime;
             await clock.Delay(TimeSpan.FromMilliseconds(Config.DownloadMs), cts.Token).ConfigureAwait(false);
             return frame;
@@ -271,7 +283,7 @@ public sealed class SimulatedCamera : ICameraSource
     /// Renders a frame for an exposure starting at <paramref name="t0"/> seconds without touching the
     /// clock. Used by <see cref="CaptureAsync"/>; public for tests and benchmarks.
     /// </summary>
-    public GuideFrame Render(double t0, double exposureMs, int binning, IntRect subframe, long frameNumber, int? biasOverride = null)
+    public GuideFrame Render(double t0, double exposureMs, int binning, IntRect subframe, long frameNumber, int? biasOverride = null, int? gain = null)
     {
         int b = Math.Max(1, binning);
         int wb = SensorWidth / b, hb = SensorHeight / b;
@@ -292,7 +304,7 @@ public sealed class SimulatedCamera : ICameraSource
             else Array.Clear(starBuffer, 0, wb * hb);
 
             var truth = RenderStars(t0, exposureMs, b, wb, hb, roi, frameNumber);
-            AddNoise(frame, roi, exposureMs, b, frameNumber, biasOverride ?? Config.BiasAdu);
+            AddNoise(frame, roi, exposureMs, b, frameNumber, biasOverride ?? Config.BiasAdu, ElectronsPerAdu(gain ?? Volatile.Read(ref currentGain)));
             ApplyDefects(frame, roi, b);
             lastTruth = truth;
         }
@@ -424,13 +436,19 @@ public sealed class SimulatedCamera : ICameraSource
         }
     }
 
-    private void AddNoise(GuideFrame frame, IntRect roi, double exposureMs, int b, long frameNumber, double bias)
+    /// <summary>Conversion gain (electrons per ADU) at a gain setting.</summary>
+    public double ElectronsPerAdu(int gain) =>
+        Config.GainElectronsPerAdu / Math.Pow(10.0, gain / Math.Max(1e-6, Config.GainUnitsPerDecade));
+
+    private int ClampGain(int gain) => Math.Clamp(gain, Math.Min(Config.GainMin, Config.GainMax), Math.Max(Config.GainMin, Config.GainMax));
+
+    private void AddNoise(GuideFrame frame, IntRect roi, double exposureMs, int b, long frameNumber, double bias, double electronsPerAdu)
     {
         double expSec = exposureMs / 1000.0;
         double baseE = (Config.SkyBackgroundElectronsPerSec + Config.DarkCurrentElectronsPerSec) * expSec * b * b;
         double rn = Config.ReadNoiseElectrons;
         double rn2 = rn * rn;
-        double invGain = 1.0 / Math.Max(1e-6, Config.GainElectronsPerAdu);
+        double invGain = 1.0 / Math.Max(1e-6, electronsPerAdu);
         double baseSigma = Math.Sqrt(baseE + rn2);
         bool baseGaussian = baseE >= 20;
         int wb = frame.Width;
