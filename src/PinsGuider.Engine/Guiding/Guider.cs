@@ -757,6 +757,7 @@ public sealed partial class Guider : IAsyncDisposable
             // the snapshot was taken before the exposure: never pulse a mount that started slewing/parked meanwhile
             if (MountStateWatcher.Evaluate(SafeSnapshot()) != MountPauseReason.None)
             {
+                coachPulsesDropped = IsCoachMeasuring;
                 return;
             }
 
@@ -1531,10 +1532,7 @@ public sealed partial class Guider : IAsyncDisposable
     private void HandleMountState(MountSnapshot snapshot)
     {
         var reason = mountWatch.Update(snapshot);
-        if (reason != MountPauseReason.None)
-        {
-            InterruptCoachOnLoop(reason == MountPauseReason.Disconnected ? CoachInterruptReasons.Disconnect : CoachInterruptReasons.Slew);
-        }
+        UpdateCoachMountGate(snapshot);
 
         if (!(state.IsGuidingActive() || state == GuiderState.Calibrating))
         {

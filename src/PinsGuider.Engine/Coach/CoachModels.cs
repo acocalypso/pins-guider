@@ -522,6 +522,10 @@ public static class CoachInterruptReasons
     public const string Dither = "dither";
     public const string Stopped = "stopped";
     public const string Slew = "slew";
+
+    /// <summary>Tracking stayed off (<see cref="Guiding.SafetySettings.CoachMountInterruptSeconds"/>).</summary>
+    public const string TrackingOff = "trackingOff";
+
     public const string Disconnect = "disconnect";
 
     /// <summary>Internal: a measurement hook threw (reported as <see cref="CoachCodes.Internal"/>).</summary>

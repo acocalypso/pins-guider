@@ -121,7 +121,7 @@ internal sealed class CameraSweep(ICameraSource camera, FramePreprocessor prepro
 {
     /// <summary>Measures one combination. Returns the frame measurements and the usable star count.</summary>
     public async Task<(IReadOnlyList<CameraFrameMeasurement> Frames, int Stars)> MeasureAsync(CameraCombination c, int frames, int binning, int? offset,
-        StarFinderOptions finder, int maxStars, Action<GuideFrame, Star?>? onFrame, CancellationToken ct)
+        StarFinderOptions finder, int maxStars, Action<GuideFrame, Star?>? onFrame, CancellationToken ct, Func<CancellationToken, Task>? beforeCapture = null)
     {
         var result = new List<CameraFrameMeasurement>(frames);
         int stars = 0;
@@ -131,6 +131,11 @@ internal sealed class CameraSweep(ICameraSource camera, FramePreprocessor prepro
         for (int i = 0; i < frames; i++)
         {
             ct.ThrowIfCancellationRequested();
+            if (beforeCapture is not null)
+            {
+                await beforeCapture(ct).ConfigureAwait(false);
+            }
+
             GuideFrame raw;
             double t = clock.NowSeconds() - t0;
             try

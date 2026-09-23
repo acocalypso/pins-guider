@@ -15,6 +15,18 @@ internal sealed record CoachFrame
 
     public GuiderState State { get; init; }
 
+    /// <summary>
+    /// A mount condition (slewing, homing, tracking off) is active but not (yet) confirmed as an interruption: measurements
+    /// skip the frame; trials don't count its time.
+    /// </summary>
+    public bool MountBusy { get; init; }
+
+    /// <summary>The pulses the hook requested after the previous frame were not sent (the mount became busy).</summary>
+    public bool PulsesDropped { get; init; }
+
+    /// <summary>Mount-reported right ascension (hours) of the snapshot before the exposure, null when unknown.</summary>
+    public double? RightAscensionHours { get; init; }
+
     /// <summary>Primary star measured this frame (not estimated from secondaries).</summary>
     public bool StarFound { get; init; }
 

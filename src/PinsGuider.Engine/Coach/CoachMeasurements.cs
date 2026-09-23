@@ -99,7 +99,12 @@ internal sealed class DriftMeasurement(double targetSeconds, double lostTimeoutS
             exposureSeconds = f.ExposureMs / 1000.0;
             pixelScale = f.PixelScale;
             declination = f.DeclinationDeg ?? declination;
-            if (f.StarFound && f.MountOffset.IsValid)
+            if (f.MountBusy)
+            {
+                // the mount reports slewing/tracking off: no sample (a real goto interrupts the session separately)
+                lostSince = null;
+            }
+            else if (f.StarFound && f.MountOffset.IsValid)
             {
                 lostSince = null;
                 samples.Add(new DriftSample(elapsed, f.MountOffset.X, f.MountOffset.Y, f.Snr));
@@ -307,12 +312,12 @@ internal sealed class TrialObserver(double seconds, double lostTimeoutSec, Actio
     private readonly object gate = new();
     private readonly TaskCompletionSource<TrialObservation> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly List<TrialSample> samples = [];
-    private DateTimeOffset? start;
     private DateTimeOffset? lostSince;
     private double elapsed;
     private double pixelScale = 1.0;
     private bool finished;
     private bool measuring;
+    private DateTimeOffset? lastFrame;
 
     public bool SuspendsGuiding => false;
 
@@ -378,10 +383,19 @@ internal sealed class TrialObserver(double seconds, double lostTimeoutSec, Actio
                 return [];
             }
 
-            start ??= f.Time;
-            elapsed = (f.Time - start.Value).TotalSeconds;
+            // time of frames with a busy mount (the guider pauses corrections) does not count toward the trial
+            if (lastFrame is { } lf && !f.MountBusy)
+            {
+                elapsed += (f.Time - lf).TotalSeconds;
+            }
+
+            lastFrame = f.Time;
             pixelScale = f.PixelScale;
-            if (f.StarFound && f.MountOffset.IsValid)
+            if (f.MountBusy)
+            {
+                lostSince = null;
+            }
+            else if (f.StarFound && f.MountOffset.IsValid)
             {
                 lostSince = null;
                 if (!f.IsSettling && !f.IsRecenterMove)

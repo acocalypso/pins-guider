@@ -20,6 +20,9 @@ public sealed partial class Guider
     private readonly object publishLock = new();
     private readonly LiveHintAnalyser liveHints = new();
     private readonly CombinedPositionMeter combinedMeter = new();
+    private readonly CoachMountGate coachMountGate = new();
+    private bool coachMountBusy;
+    private bool coachPulsesDropped;
 
     private Action<string>? coachInterrupt;
     private ICoachFrameHook? coachHook;
@@ -68,7 +71,22 @@ public sealed partial class Guider
     #region coach session API (internal)
 
     /// <summary>Attaches a coach session; <paramref name="onInterrupt"/> is called once when a host command or event interrupts it.</summary>
-    internal bool AttachCoach(Action<string> onInterrupt) => Interlocked.CompareExchange(ref coachInterrupt, onInterrupt, null) is null;
+    internal bool AttachCoach(Action<string> onInterrupt)
+    {
+        if (Interlocked.CompareExchange(ref coachInterrupt, onInterrupt, null) is not null)
+        {
+            return false;
+        }
+
+        coachMountGate.Reset();
+        return true;
+    }
+
+    /// <summary>
+    /// Debounced mount check for the coach outside the loop (camera check): busy while a condition is active, an interrupt
+    /// reason once it is confirmed (see <see cref="CoachMountGate"/>).
+    /// </summary>
+    internal CoachMountVerdict CheckCoachMount() => coachMountGate.Update(SafeSnapshot(), clock.UtcNow, settings.Safety);
 
     /// <summary>Detaches the session (no further interrupts). Does not restore state; see <see cref="ClearCoachStateAsync"/>.</summary>
     internal void DetachCoach() => Volatile.Write(ref coachInterrupt, null);
@@ -354,6 +372,24 @@ public sealed partial class Guider
         }
     }
 
+    /// <summary>Loop side of the coach mount debounce: marks frames busy and interrupts once a condition is confirmed.</summary>
+    private void UpdateCoachMountGate(Core.MountSnapshot snapshot)
+    {
+        if (Volatile.Read(ref coachInterrupt) is null)
+        {
+            coachMountBusy = false;
+            coachMountGate.Reset();
+            return;
+        }
+
+        var verdict = coachMountGate.Update(snapshot, clock.UtcNow, settings.Safety);
+        coachMountBusy = verdict.Busy;
+        if (verdict.InterruptReason is { } reason)
+        {
+            InterruptCoachOnLoop(reason);
+        }
+    }
+
     private void DrainPublishedEvents()
     {
         while (publishedEvents.TryDequeue(out var e))
@@ -364,11 +400,15 @@ public sealed partial class Guider
 
     /// <param name="combined">Measurement frames: the multi-star combined camera position from <see cref="CombinedPositionMeter"/>.</param>
     private CoachFrame BuildCoachFrame(GuideFrame frame, MultiStarFrameResult r, MountTransform t, GuidePoint mountOfs, Core.MountSnapshot snapshot,
-        DateTimeOffset now, bool found, GuideCorrection? corr, bool recenterMove, GuidePoint? combined = null, int? starsUsed = null) => new()
+        DateTimeOffset now, bool found, GuideCorrection? corr, bool recenterMove, GuidePoint? combined = null, int? starsUsed = null,
+        bool pulsesDropped = false) => new()
     {
         Time = now,
         FrameNumber = frame.FrameNumber,
         State = state,
+        MountBusy = coachMountBusy,
+        PulsesDropped = pulsesDropped,
+        RightAscensionHours = snapshot.RightAscensionHours,
         StarFound = found,
         StarPosition = found ? r.Primary.Position : GuidePoint.Invalid,
         MountOffset = !found ? GuidePoint.Invalid
@@ -438,10 +478,12 @@ public sealed partial class Guider
                 tracker.FinderOptions, tracker.SearchRegion, settings.MultiStar.MultiStarEnabled ? tracker.FinderOptions.MaxStars : 1, pixelScale, out used);
         }
 
+        bool dropped = coachPulsesDropped;
+        coachPulsesDropped = false;
         IReadOnlyList<PulseCommand> requested;
         try
         {
-            requested = hook.OnFrame(BuildCoachFrame(frame, r, t, mountOfs, snapshot, now, found, null, false, combined, used));
+            requested = hook.OnFrame(BuildCoachFrame(frame, r, t, mountOfs, snapshot, now, found, null, false, combined, used, dropped));
         }
         catch
         {
