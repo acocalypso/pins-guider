@@ -83,7 +83,8 @@ If your mount driver misreports *slewing* or *tracking*, turn off `PauseWhenSlew
 
 ## 5. Files
 
-* Guide logs (PHD2 format, open with PHD2 Log Viewer): `~/.local/share/NINA/NativeGuider/Logs/`
+* Guide logs (PHD2 format, open with PHD2 Log Viewer): `~/.local/share/NINA/NativeGuider/Logs/PinsGuider_GuideLog_<night>.txt`
+  (one file per night, noon to noon)
 * Calibrations: `~/.local/share/NINA/NativeGuider/calibrations.json`
 * Dark libraries: `~/.local/share/NINA/NativeGuider/Darks/`
 * PINS log (search for `NativeGuider`): `~/.local/share/NINA/Logs/`
@@ -96,7 +97,7 @@ Build the image from the `aduffeck/pins` branch `feat/native-guider` with local 
 
 ```sh
 cd pins   # checkout of feat/native-guider with submodules NINA.Plugins/pins-guider and NINA.Plugins/Touch-N-Stars
-docker build --build-context local-plugins=NINA.Plugins --build-context tns-frontend=../Touch-N-Stars \
+docker build --network host --build-context local-plugins=NINA.Plugins --build-context tns-frontend=../Touch-N-Stars \
   --build-arg BUILD_PLUGINS="ninaapi touch-n-stars polaralignment joko livestack nightsummary pins-guider" \
   -t aduffeck/pins:native-guider .
 ```

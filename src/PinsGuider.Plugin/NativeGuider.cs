@@ -138,6 +138,14 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
             RaisePropertyChanged(nameof(State));
             return true;
         }
+        catch (GuideCameraException ex)
+        {
+            // configuration/hardware problem the user can fix: no stack trace in the log
+            Logger.Warning($"NativeGuider: connect failed: {ex.Message}");
+            Notification.ShowError($"Native guider: {ex.Message}");
+            await CleanupAsync().ConfigureAwait(false);
+            return false;
+        }
         catch (Exception ex)
         {
             Logger.Error(ex);
@@ -1227,7 +1235,9 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
         {
             var dir = Path.Combine(CoreUtil.APPLICATIONTEMPPATH, "NativeGuider", "Logs");
             Directory.CreateDirectory(dir);
-            var path = Path.Combine(dir, GuidingLog.FileName(DateTime.Now));
+            // one log per night (noon to noon) like PHD2's per-session log; reconnects append to it
+            var night = DateTime.Now.AddHours(-12).Date;
+            var path = Path.Combine(dir, $"PinsGuider_GuideLog_{night:yyyy-MM-dd}.txt");
             guideLogWriter = new StreamWriter(path, append: true) { AutoFlush = true };
             guideLog = new GuidingLog(guideLogWriter, SystemClock.Instance, new GuidingLogOptions { AppVersion = "PINS Native Guider " + DriverVersion });
             guideLog.EnableLogging();
