@@ -155,11 +155,18 @@ public sealed class SimulatedMount : IPulseOutput, IMountState
         lock (gate)
         {
             double now = clock.NowSeconds();
+
+            // reported coordinates follow slews (commanded moves) but not tracking errors, like real encoders
+            var moved = GetPointingErrorBreakdown(now).Moves;
+            double dec = declinationDeg + moved.Dec / 3600.0;
+            double cosDec = Math.Max(Math.Cos(declinationDeg * Math.PI / 180.0), 1e-6);
+            double ra = Config.RightAscensionHours - moved.Ra / (15.0 * 3600.0 * cosDec);
+            ra = ((ra % 24.0) + 24.0) % 24.0;
             return new MountSnapshot
             {
                 IsConnected = IsConnected,
-                DeclinationDeg = declinationDeg,
-                RightAscensionHours = Config.RightAscensionHours,
+                DeclinationDeg = dec,
+                RightAscensionHours = ra,
                 PierSide = ReportedPierSideOverride ?? pierSide,
                 IsSlewing = now < slewEnd,
                 IsParked = isParked,

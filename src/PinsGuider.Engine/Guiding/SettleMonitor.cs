@@ -45,7 +45,7 @@ public sealed class SettleMonitor
     public void Cancel() => settle = null;
 
     /// <param name="lockedOnStar">Star was found this frame and a lock position exists.</param>
-    /// <param name="currentError">Current guide error (<see cref="DistanceTracker.CurrentError"/>).</param>
+    /// <param name="currentError">Current guide error (PHD2 CurrentError, see MultiStar.DistanceAverager).</param>
     public SettleProgress Update(bool lockedOnStar, double currentError, DateTimeOffset now)
     {
         var s = settle ?? throw new InvalidOperationException("settle not active");

@@ -71,30 +71,6 @@ public class SettleAndDitherTests
     }
 
     [Test]
-    public void DistanceTracker_ema_and_staleness()
-    {
-        var d = new DistanceTracker();
-        d.Update(2.0, 1.0, false, T0);
-        d.CurrentError(T0, false).Should().Be(2.0);
-        d.Update(1.0, 0.5, true, T0.AddSeconds(2));
-        d.CurrentError(T0.AddSeconds(2), false).Should().BeApproximately(2.0 + 0.3 * (1.0 - 2.0), 1e-12);
-        d.CurrentError(T0.AddSeconds(2), true).Should().BeApproximately(1.0 + 0.3 * (0.5 - 1.0), 1e-12);
-        d.CurrentError(T0.AddSeconds(23), false).Should().Be(DistanceTracker.LargeDistance);
-        new DistanceTracker().CurrentError(T0, false).Should().Be(DistanceTracker.LargeDistance);
-    }
-
-    [Test]
-    public void DistanceTracker_reset_request_reinitialises()
-    {
-        var d = new DistanceTracker();
-        d.Update(5, 5, true, T0);
-        d.Update(5, 5, true, T0);
-        d.RequestReset();
-        d.Update(0.2, 0.1, true, T0);
-        d.CurrentError(T0, false).Should().Be(0.2);
-    }
-
-    [Test]
     public void Random_dither_is_within_amount_and_ra_only_has_no_dec()
     {
         var p = new DitherPlanner(42);
