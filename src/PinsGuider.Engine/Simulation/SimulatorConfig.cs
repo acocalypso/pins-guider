@@ -76,8 +76,26 @@ public sealed record MountSimConfig
     /// <summary>Dec gear backlash dead band (arcsec) taken up on every Dec reversal.</summary>
     public double DecBacklashArcsec { get; init; }
 
+    /// <summary>The dead band as pulse time at the Dec guide rate (ms): what a backlash measurement should find.</summary>
+    public double DecBacklashMs => GuideRateDec > 0 ? DecBacklashArcsec / (GuideRateDec * SimulatedMount.SiderealArcsecPerSec) * 1000.0 : 0;
+
     /// <summary>The first <c>RaStictionMs</c> of every RA pulse produce no motion.</summary>
     public double RaStictionMs { get; init; }
+
+    /// <summary>The first <c>DecStictionMs</c> of every Dec pulse produce no motion (before any backlash take-up).</summary>
+    public double DecStictionMs { get; init; }
+
+    /// <summary>Speed factor of West pulses (asymmetric guide rates: gear mesh, balance); 1 = nominal.</summary>
+    public double RaWestEfficiency { get; init; } = 1.0;
+
+    /// <summary>Speed factor of East pulses.</summary>
+    public double RaEastEfficiency { get; init; } = 1.0;
+
+    /// <summary>Speed factor of North pulses (motor direction).</summary>
+    public double DecNorthEfficiency { get; init; } = 1.0;
+
+    /// <summary>Speed factor of South pulses (motor direction).</summary>
+    public double DecSouthEfficiency { get; init; } = 1.0;
 
     /// <summary>
     /// When true (typical GEM behaviour, matching PHD2's default of not flipping Dec calibration), a North

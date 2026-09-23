@@ -32,7 +32,9 @@ public readonly record struct PointingErrorBreakdown(
 /// <c>rate·15.041″/s·cos(dec)·duration</c>, East the opposite; North moves the pointing North by
 /// <c>rate·15.041″/s·duration</c> (reversed on pier side West when
 /// <see cref="MountSimConfig.DecGuideReversedOnWestPier"/>, and reversed again by the
-/// <see cref="InvertDecPulses"/> fault). The motion is spread linearly over the pulse, and
+/// <see cref="InvertDecPulses"/> fault). Speeds are scaled per direction (<see cref="MountSimConfig.RaWestEfficiency"/> ...),
+/// the first <see cref="MountSimConfig.RaStictionMs"/> / <see cref="MountSimConfig.DecStictionMs"/> of a pulse produce no
+/// motion, and Dec reversals first take up the backlash dead band. The motion is spread linearly over the pulse, and
 /// <see cref="PulseAsync"/> advances the clock by the pulse duration.
 /// </para>
 /// </remarks>
@@ -326,15 +328,17 @@ public sealed class SimulatedMount : IPulseOutput, IMountState
         {
             double stiction = Math.Min(dur, Config.RaStictionMs / 1000.0);
             double v = guideRateRa * SiderealArcsecPerSec * Math.Cos(declinationDeg * Math.PI / 180.0);
+            v *= direction == GuideDirection.West ? Config.RaWestEfficiency : Config.RaEastEfficiency;
             if (direction == GuideDirection.West) v = -v;
             raPulses.Add(now + stiction, now + dur, v);
             return raPulses;
         }
 
-        // Dec: backlash acts on the motor; motor "North" = +.
-        double speed = guideRateDec * SiderealArcsecPerSec;
+        // Dec: stiction delays the start, then backlash acts on the motor; motor "North" = +.
+        double decStiction = Math.Min(dur, Config.DecStictionMs / 1000.0);
+        double speed = guideRateDec * SiderealArcsecPerSec * (direction == GuideDirection.North ? Config.DecNorthEfficiency : Config.DecSouthEfficiency);
         double motorSign = direction == GuideDirection.North ? 1.0 : -1.0;
-        double motion = speed * dur;
+        double motion = speed * (dur - decStiction);
         double takeUp = 0;
         double band = Config.DecBacklashArcsec;
         if (band > 0)
@@ -354,7 +358,7 @@ public sealed class SimulatedMount : IPulseOutput, IMountState
         double skySign = motorSign;
         if (pierSide == PierSide.West && Config.DecGuideReversedOnWestPier) skySign = -skySign;
         if (InvertDecPulses) skySign = -skySign;
-        double start = now + (speed > 0 ? takeUp / speed : dur);
+        double start = now + decStiction + (speed > 0 ? takeUp / speed : dur);
         decPulses.Add(start, now + dur, skySign * speed);
         return decPulses;
     }

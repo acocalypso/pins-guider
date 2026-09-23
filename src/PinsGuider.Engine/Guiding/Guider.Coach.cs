@@ -56,6 +56,13 @@ public sealed partial class Guider
 
     internal int TrackerSearchRegion => tracker.SearchRegion;
 
+    /// <summary>Guiding output state of the corrector (false only during coach measurements).</summary>
+    internal bool GuidingOutputEnabled => corrector.GuidingEnabled;
+
+    internal bool HasCoachOverlay => coachOverlay is not null;
+
+    internal bool HasCoachHook => coachHook is not null;
+
     private bool IsCoachMeasuring => coachHook is { SuspendsGuiding: true };
 
     #region coach session API (internal)
@@ -83,6 +90,29 @@ public sealed partial class Guider
         StartGuidingCoreAsync(settleParams, false, ct, loopToken, forceLoop: true);
 
     internal void StopGuidingForCoach() => Post(() => StopGuidingCore(GuiderState.Selected));
+
+    /// <summary>Starts looping (e.g. after the camera check stopped the loop) without interrupting the session.</summary>
+    internal void StartLoopingForCoach(CancellationToken loopToken)
+    {
+        Post(() =>
+        {
+            if (state is GuiderState.Stopped or GuiderState.Failed)
+            {
+                ClearRequests();
+                SetState(GuiderState.Looping);
+            }
+        });
+        EnsureLoop(loopToken, force: true);
+    }
+
+    /// <summary>Executes queued commands on the caller when the loop is not running (commands posted as it ended).</summary>
+    internal void FlushCommandsIfIdle()
+    {
+        if (!IsLoopRunning)
+        {
+            DrainCommands();
+        }
+    }
 
     internal void PauseForCoach() => PauseCore(false);
 
