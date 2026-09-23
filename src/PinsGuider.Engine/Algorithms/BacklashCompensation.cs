@@ -82,6 +82,9 @@ public sealed class BacklashCompensation
     private void SetCompValues(int requestedSize, int floor, int ceiling)
     {
         pulseWidth = Math.Clamp(requestedSize, 0, MaxCompAmount);
+
+        // Deviation from PHD2: PHD2 compares the int floor with an unsigned constant, so a negative floor
+        // slips through unchanged; here it becomes the 20 ms minimum like any other floor below 20.
         if (floor > pulseWidth || floor < MinCompAmount) // Coming from GA or user input makes no sense
             adjustmentFloor = MinCompAmount;
         else
