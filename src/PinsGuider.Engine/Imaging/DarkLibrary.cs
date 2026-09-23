@@ -54,6 +54,9 @@ public sealed class DarkLibrary
     public const int DefaultFramesPerDark = 5;
 
     private readonly object gate = new();
+
+    // Deviation from PHD2: PHD2 keys darks by exposure only (the library belongs to one camera binning and
+    // is invalidated when binning changes); we key by (binning, exposure) and select within the binning.
     private readonly SortedDictionary<(int Binning, double ExposureMs), DarkFrame> darks = new();
 
     public DarkPedestalMode PedestalMode { get; set; } = DarkPedestalMode.Phd2Runtime;
@@ -142,6 +145,8 @@ public sealed class DarkLibrary
             medianDark = dark.MedianAdu;
         }
 
+        // Deviation from PHD2 (only with DarkPedestalMode.LightMedian): uses the actual light median;
+        // the default Phd2Runtime mode reproduces PHD2's effective behaviour (light median not yet computed = 0).
         ushort medianLight = mode == DarkPedestalMode.LightMedian
             ? ImageMath.MedianValueInRoi(light.Pixels, light.Width, roi)
             : (ushort)0;

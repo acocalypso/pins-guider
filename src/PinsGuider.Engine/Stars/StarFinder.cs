@@ -363,6 +363,7 @@ internal static class StarFinder
     }
 
     // C++ (unsigned short)(double) for the value range that occurs in practice.
+    // Deviation from PHD2: out-of-range values (undefined behaviour in C++) are clamped.
     private static ushort ToUShort(double v) => v >= 65535.0 ? ushort.MaxValue : v <= 0 ? (ushort)0 : (ushort)(uint)v;
 
     private static double Hfr(Span<R2M> vec, double cx, double cy, double mass)

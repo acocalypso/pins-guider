@@ -103,6 +103,8 @@ public sealed class MultiStarTracker
         var diag = new AutoFindDiagnostics();
         int listSize = options.UseSubframes || !options.MultiStarEnabled ? 1 : options.MaxListSize;
         var list = GuideStar.AutoFind(frame, edgeAllowance, SearchRegion, roi, listSize, FinderOptions, diag);
+        // Deviation from PHD2: a failed AutoFind leaves the current guide star list untouched (PHD2's
+        // AutoFind may already have cleared m_guideStars).
         if (list.Count == 0)
             return new AutoSelectResult(false, default, list, diag);
         return InitializeCore(frame, list, diag.PrimaryPeak, diag);
@@ -311,6 +313,8 @@ public sealed class MultiStarTracker
         {
             offset = primary.Position - lockPosition;
             primaryOnly = offset;
+            // Deviation from PHD2: secondaries are not measured on subframed frames (PHD2 relies on the list
+            // having a single star in subframe mode).
             if (options.MultiStarEnabled && guideStars.Count > 1 && frame.Subframe.IsEmpty)
             {
                 if (RefineOffset(frame, ref offset, state))
