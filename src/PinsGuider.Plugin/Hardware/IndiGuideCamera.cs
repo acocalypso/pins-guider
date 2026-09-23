@@ -13,7 +13,7 @@ namespace PinsGuider.Plugin.Hardware;
 /// under its own "GuideCamera" category so it never evicts the main camera's driver. Frames arrive as FITS BLOBs and
 /// are decoded in memory.
 /// </summary>
-internal sealed class IndiGuideCamera : ICameraSource, IDisposable
+internal sealed class IndiGuideCamera : ICameraSource, IGainRange, IDisposable
 {
     /// <summary>INDIClient category key for the guide camera driver (separate from "Camera").</summary>
     public const string Category = "GuideCamera";
@@ -51,6 +51,12 @@ internal sealed class IndiGuideCamera : ICameraSource, IDisposable
     public ushort MaxAdu => 0;
 
     public int BitsPerPixel => camera?.BitDepth ?? 16;
+
+    public int? GainMin => camera is { CanGetGain: true } c && c.GainMax > c.GainMin ? c.GainMin : null;
+
+    public int? GainMax => camera is { CanGetGain: true } c && c.GainMax > c.GainMin ? c.GainMax : null;
+
+    public int? CurrentGain => camera is { CanGetGain: true } c ? c.Gain : null;
 
     /// <summary>INDI device name, used to address the camera's ST4 guide port.</summary>
     public string? DeviceId => info?.Id;
