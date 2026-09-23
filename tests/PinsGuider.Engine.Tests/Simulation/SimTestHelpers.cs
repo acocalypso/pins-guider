@@ -54,7 +54,7 @@ internal static class SimTestHelpers
         return (sx / s, sy / s, s);
     }
 
-    public static (double Mean, double Sigma) Stats(GuideFrame f, IntRect r)
+    public static (double Mean, double Sigma) FrameStats(GuideFrame f, IntRect r)
     {
         double sum = 0, sum2 = 0;
         long n = 0;

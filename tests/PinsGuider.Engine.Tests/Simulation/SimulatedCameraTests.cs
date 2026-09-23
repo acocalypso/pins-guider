@@ -51,7 +51,7 @@ public class SimulatedCameraTests
         var sim = new Simulator(Clean() with { Sky = new SkySimConfig { Stars = [] }, Camera = cfg });
 
         var frame = sim.Camera.Render(0, 1000, 1, IntRect.Empty, 1);
-        var (mean, sigma) = Stats(frame, new IntRect(0, 0, frame.Width, frame.Height));
+        var (mean, sigma) = FrameStats(frame, new IntRect(0, 0, frame.Width, frame.Height));
 
         double electrons = 40 + cfg.DarkCurrentElectronsPerSec;
         mean.Should().BeApproximately(500 + electrons / 0.5, 0.1);
@@ -64,7 +64,7 @@ public class SimulatedCameraTests
         var sim = new Simulator(Clean() with { Sky = new SkySimConfig { Stars = [] } });
 
         var frame = sim.Camera.Render(0, 0, 1, IntRect.Empty, 1);
-        var (mean, sigma) = Stats(frame, new IntRect(0, 0, frame.Width, frame.Height));
+        var (mean, sigma) = FrameStats(frame, new IntRect(0, 0, frame.Width, frame.Height));
 
         mean.Should().BeApproximately(200, 0.05);
         sigma.Should().BeApproximately(3.5, 0.05);
@@ -77,7 +77,7 @@ public class SimulatedCameraTests
         var sim = new Simulator(Clean() with { Sky = new SkySimConfig { Stars = [] }, Camera = cfg });
 
         var frame = sim.Camera.Render(0, 1000, 1, new IntRect(0, 0, 800, 800), 1);
-        var (mean, sigma) = Stats(frame, frame.Subframe);
+        var (mean, sigma) = FrameStats(frame, frame.Subframe);
 
         mean.Should().BeApproximately(202, 0.02);
         sigma.Should().BeApproximately(Math.Sqrt(2), 0.02);
