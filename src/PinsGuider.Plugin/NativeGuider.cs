@@ -195,7 +195,7 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
         }
         else
         {
-            indiCamera = new IndiGuideCamera(options.GuideCameraDriver, options.GuideCameraDevice, MainCameraName);
+            indiCamera = new IndiGuideCamera(options.GuideCameraDriver, options.GuideCameraDevice, MainCameraName, ConnectedMainCameraName);
             await indiCamera.ConnectAsync(ct).ConfigureAwait(false);
             camera = indiCamera;
             var cam = indiCamera;
@@ -584,10 +584,10 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
 
         try
         {
-            // never offer the main imaging camera as guide camera
+            // all cameras of the driver; the main imaging camera (if among them) goes last - the UI marks it
             var main = MainCameraName();
             var devices = await IndiGuideCamera.ListDevicesAsync(options.GuideCameraDriver, ct).ConfigureAwait(false);
-            return devices.Where(d => main is null || !string.Equals(d, main, StringComparison.OrdinalIgnoreCase)).ToList();
+            return devices.OrderBy(d => main is not null && string.Equals(d, main, StringComparison.OrdinalIgnoreCase)).ToList();
         }
         catch (Exception ex)
         {
@@ -1112,6 +1112,20 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
         double time = gs.SettleTime > 0 ? gs.SettleTime : 10;
         double timeout = gs.SettleTimeout > 0 ? gs.SettleTimeout : 40;
         return new SettleParams(pixels, time, timeout);
+    }
+
+    /// <summary>The imaging camera's device name while it is connected (then it can't also be the guide camera).</summary>
+    private string? ConnectedMainCameraName()
+    {
+        try
+        {
+            var info = cameraMediator.GetInfo();
+            return info is { Connected: true } && !string.IsNullOrEmpty(info.DeviceId) ? info.DeviceId : null;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private string? MainCameraName()

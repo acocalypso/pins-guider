@@ -21,15 +21,19 @@ internal sealed class IndiGuideCamera : ICameraSource, IDisposable
     private readonly string driver;
     private readonly string requestedDevice;
     private readonly Func<string?> mainCameraName;
+    private readonly Func<string?> connectedMainCameraName;
     private readonly SemaphoreSlim gate = new(1, 1);
     private INDICamera? camera;
     private INDIDeviceInfo? info;
 
-    public IndiGuideCamera(string driver, string deviceName, Func<string?> mainCameraName)
+    /// <param name="mainCameraName">The profile's imaging camera (never auto-selected as guide camera).</param>
+    /// <param name="connectedMainCameraName">The imaging camera while connected (can't be used for guiding then).</param>
+    public IndiGuideCamera(string driver, string deviceName, Func<string?> mainCameraName, Func<string?>? connectedMainCameraName = null)
     {
         this.driver = driver;
         requestedDevice = deviceName ?? string.Empty;
         this.mainCameraName = mainCameraName;
+        this.connectedMainCameraName = connectedMainCameraName ?? mainCameraName;
     }
 
     public string Name => info?.Id ?? requestedDevice;
@@ -119,9 +123,11 @@ internal sealed class IndiGuideCamera : ICameraSource, IDisposable
             chosen = others[0];
         }
 
-        if (main is not null && string.Equals(chosen.Id, main, StringComparison.OrdinalIgnoreCase))
+        // explicitly choosing the profile's imaging camera is fine (e.g. simulators) unless it is connected for imaging
+        string? inUse = connectedMainCameraName();
+        if (inUse is not null && string.Equals(chosen.Id, inUse, StringComparison.OrdinalIgnoreCase))
         {
-            throw new GuideCameraException($"'{chosen.Id}' is the main imaging camera; choose a different guide camera.");
+            throw new GuideCameraException($"'{chosen.Id}' is connected as the imaging camera; disconnect it or choose a different guide camera.");
         }
 
         info = chosen;
