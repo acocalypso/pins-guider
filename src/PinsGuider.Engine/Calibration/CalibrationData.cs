@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
+using System.Text.Json.Serialization;
 using PinsGuider.Engine.Core;
 
 namespace PinsGuider.Engine.Calibration;
@@ -17,10 +18,13 @@ public enum GuideParity
 /// <summary>Result of a calibration (port of PHD2 Calibration struct).</summary>
 public sealed record CalibrationData
 {
-    /// <summary>Camera angle of the RA (west) axis, radians.</summary>
+    /// <summary>
+    /// Camera angle of the RA axis, radians (PHD2 xAngle). Following PHD2 this is the direction the star
+    /// moves on the sensor for an East pulse, i.e. opposite to the measured West calibration motion.
+    /// </summary>
     public double XAngle { get; init; }
 
-    /// <summary>Camera angle of the Dec (north) axis, radians.</summary>
+    /// <summary>Camera angle of the Dec axis, radians (PHD2 yAngle): direction the star moves for a North pulse.</summary>
     public double YAngle { get; init; }
 
     /// <summary>RA rate, pixels per millisecond of pulse at <see cref="Binning"/>.</summary>
@@ -55,4 +59,35 @@ public sealed record CalibrationData
     public DateTimeOffset Timestamp { get; init; }
 
     public bool IsValid => XRate > 0 && !double.IsNaN(XAngle);
+
+    // ---- Additive members (M1 calibration workstream) ----
+
+    /// <summary>True when a Dec rate was measured (PHD2: yRate != CALIBRATION_RATE_UNCALIBRATED).</summary>
+    [JsonIgnore]
+    public bool HasDecCalibration => YRate > 0 && !double.IsNaN(YRate) && !double.IsInfinity(YRate);
+
+    /// <summary>Number of West steps used to measure the RA rate (PHD2 CalibrationDetails.raStepCount).</summary>
+    public int RaStepCount { get; init; }
+
+    /// <summary>Number of North steps used to measure the Dec rate; 0 when Dec was not calibrated.</summary>
+    public int DecStepCount { get; init; }
+
+    /// <summary>Star displacement (start - current, px) logged at each RA calibration step (West then East).</summary>
+    public IReadOnlyList<GuidePoint> RaSteps { get; init; } = [];
+
+    /// <summary>Star displacement (start - current, px) logged at each Dec calibration step (North then South).</summary>
+    public IReadOnlyList<GuidePoint> DecSteps { get; init; } = [];
+
+    /// <summary>Calibration pulse duration used, ms.</summary>
+    public int CalibrationStepMs { get; init; }
+
+    /// <summary>Calibration distance used, px.</summary>
+    public int CalibrationDistancePx { get; init; }
+
+    /// <summary>Sanity issue flagged for this calibration (PHD2 CalibrationDetails.lastIssue).</summary>
+    public CalibrationIssueType LastIssue { get; init; }
+
+    /// <summary>Deviation of the RA/Dec axes from perpendicular, degrees (PHD2 orthoError).</summary>
+    [JsonIgnore]
+    public double OrthogonalityErrorDeg => MountTransform.OrthogonalityErrorDegrees(XAngle, YAngle);
 }
