@@ -583,7 +583,10 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
 
         try
         {
-            return await IndiGuideCamera.ListDevicesAsync(options.GuideCameraDriver, ct).ConfigureAwait(false);
+            // never offer the main imaging camera as guide camera
+            var main = MainCameraName();
+            var devices = await IndiGuideCamera.ListDevicesAsync(options.GuideCameraDriver, ct).ConfigureAwait(false);
+            return devices.Where(d => main is null || !string.Equals(d, main, StringComparison.OrdinalIgnoreCase)).ToList();
         }
         catch (Exception ex)
         {

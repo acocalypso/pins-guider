@@ -47,10 +47,10 @@ internal sealed class NativeGuiderOptions
     public static readonly IReadOnlyList<SettingDef> Definitions =
     [
         // Camera
-        new("GuideCameraDriver", "Guide camera INDI driver", "Camera", "string", "indi_asi_ccd", Basic: true, RequiresReconnect: true,
-            Description: "INDI driver of the guide camera, e.g. indi_asi_ccd, indi_qhy_ccd, indi_playerone_ccd, indi_toupcam_ccd. 'simulator' uses the built-in sky simulator."),
-        new("GuideCameraDevice", "Guide camera device", "Camera", "string", "", Basic: true, RequiresReconnect: true,
-            Description: "INDI device name of the guide camera (e.g. 'ZWO CCD ASI120MM-S'). Empty: first camera of the driver that is not the main imaging camera."),
+        new("GuideCameraDriver", "Guide camera type", "Camera", "string", "indi_asi_ccd", Basic: true, RequiresReconnect: true,
+            Description: "Camera family of the guide camera (INDI driver). Choose 'simulator' for the built-in sky simulator."),
+        new("GuideCameraDevice", "Guide camera", "Camera", "string", "", Basic: true, RequiresReconnect: true,
+            Description: "The guide camera among the cameras of that type. Selected automatically when there is only one."),
         new("ExposureSeconds", "Exposure", "Camera", "double", "2", Basic: true, Unit: "s", Min: 0.01, Max: 30,
             Phd2Fallback: s => s.PHD2ExposureMs is { } ms && ms > 0 ? (ms / 1000.0).ToString(Inv) : null),
         new("Gain", "Gain", "Camera", "int", "-1", Basic: true, Min: -1, Max: 10000,
