@@ -19,11 +19,11 @@ public sealed partial class Guider
     private readonly ConcurrentQueue<GuiderEvent> publishedEvents = new();
     private readonly object publishLock = new();
     private readonly LiveHintAnalyser liveHints = new();
+    private readonly CombinedPositionMeter combinedMeter = new();
 
     private Action<string>? coachInterrupt;
     private ICoachFrameHook? coachHook;
     private Func<GuiderSettings, GuiderSettings>? coachOverlay;
-    private bool coachFailureHandled;
     private volatile bool coachStoppingCapture;
     private bool cameraLeased;
     private bool deferredLoopStart;
@@ -228,6 +228,7 @@ public sealed partial class Guider
     {
         bool wasMeasuring = IsCoachMeasuring;
         coachHook = hook;
+        combinedMeter.Reset();
         bool measuring = IsCoachMeasuring;
         var now = clock.UtcNow;
         if (measuring && !wasMeasuring)
@@ -327,7 +328,6 @@ public sealed partial class Guider
             if (handled)
             {
                 // only the hook's measurement ends (e.g. a runaway during a trial); the session restarts guiding
-                coachFailureHandled = true;
                 SetCoachHookCore(null);
                 return;
             }
@@ -338,9 +338,13 @@ public sealed partial class Guider
             : CoachInterruptReasons.Stopped);
     }
 
-    private void OnLoopEndedForCoach()
+    /// <summary>
+    /// The loop ended. Only a cancellation (stop capture, host token) interrupts the session here: a guiding failure was
+    /// already handled by <see cref="OnGuiderFailedForCoach"/>, and a loop that started with nothing to do ends harmlessly.
+    /// </summary>
+    private void OnLoopEndedForCoach(bool cancelled)
     {
-        if (!coachStoppingCapture && !coachFailureHandled)
+        if (cancelled && !coachStoppingCapture)
         {
             InterruptCoachOnLoop(CoachInterruptReasons.Stopped);
         }
@@ -358,20 +362,27 @@ public sealed partial class Guider
         }
     }
 
+    /// <param name="combined">Measurement frames: the multi-star combined camera position from <see cref="CombinedPositionMeter"/>.</param>
     private CoachFrame BuildCoachFrame(GuideFrame frame, MultiStarFrameResult r, MountTransform t, GuidePoint mountOfs, Core.MountSnapshot snapshot,
-        DateTimeOffset now, bool found, GuideCorrection? corr, bool recenterMove) => new()
+        DateTimeOffset now, bool found, GuideCorrection? corr, bool recenterMove, GuidePoint? combined = null, int? starsUsed = null) => new()
     {
         Time = now,
         FrameNumber = frame.FrameNumber,
         State = state,
         StarFound = found,
         StarPosition = found ? r.Primary.Position : GuidePoint.Invalid,
-        MountOffset = found ? mountOfs : GuidePoint.Invalid,
-        MountPosition = found ? t.CameraToMount(r.Primary.Position) : GuidePoint.Invalid,
+        MountOffset = !found ? GuidePoint.Invalid
+            : combined is { IsValid: true } c && lockPosition.IsValid ? t.CameraToMount(c - lockPosition)
+            : mountOfs,
+        // the combined (multi-star) position: measured by the meter, or lock + offset of normal guiding
+        MountPosition = !found ? GuidePoint.Invalid
+            : combined is { IsValid: true } c2 ? t.CameraToMount(c2)
+            : r.CameraOffset.IsValid && lockPosition.IsValid ? t.CameraToMount(lockPosition + r.CameraOffset)
+            : t.CameraToMount(r.Primary.Position),
         Snr = r.Primary.Snr,
         Mass = r.Primary.Mass,
         Hfd = r.Primary.Hfd,
-        StarsUsed = r.StarsUsed,
+        StarsUsed = starsUsed ?? r.StarsUsed,
         Transform = t,
         FrameWidth = frame.Width,
         FrameHeight = frame.Height,
@@ -419,10 +430,18 @@ public sealed partial class Guider
 
         var hook = coachHook!;
         bool found = r.Outcome == TrackerOutcome.Found;
+        GuidePoint? combined = null;
+        int used = 1;
+        if (found)
+        {
+            combined = combinedMeter.Measure(frame, r.Primary.Position, r.Primary.Snr, tracker.GuideStars,
+                tracker.FinderOptions, tracker.SearchRegion, settings.MultiStar.MultiStarEnabled ? tracker.FinderOptions.MaxStars : 1, pixelScale, out used);
+        }
+
         IReadOnlyList<PulseCommand> requested;
         try
         {
-            requested = hook.OnFrame(BuildCoachFrame(frame, r, t, mountOfs, snapshot, now, found, null, false));
+            requested = hook.OnFrame(BuildCoachFrame(frame, r, t, mountOfs, snapshot, now, found, null, false, combined, used));
         }
         catch
         {
@@ -503,4 +522,80 @@ public sealed partial class Guider
     }
 
     private void ResetLiveHints() => liveHints.ResetSession();
+}
+
+/// <summary>
+/// Multi-star combined star position for coach measurements: the SNR-weighted mean displacement of the primary and the
+/// secondary guide stars (weights SNR/primary SNR, as PHD2's multi-star offset) from their positions at the start of the
+/// measurement. Unlike the guide loop's refinement it has no stabilisation or excursion gates, so it stays consistent during
+/// unguided drift and test pulses; the seeing it measures has the same multi-star averaging as the guided RMS. A secondary
+/// whose displacement departs from the primary's by more than max(2 px, 3″) is dropped (hot pixel, wrong star).
+/// </summary>
+internal sealed class CombinedPositionMeter
+{
+    private readonly List<Secondary> secondaries = [];
+    private GuidePoint primaryReference = GuidePoint.Invalid;
+
+    public void Reset()
+    {
+        secondaries.Clear();
+        primaryReference = GuidePoint.Invalid;
+    }
+
+    /// <summary>Combined camera position this frame (the primary's reference plus the weighted mean displacement).</summary>
+    public GuidePoint Measure(GuideFrame frame, GuidePoint primary, double primarySnr, IReadOnlyList<Stars.GuideStar> guideStars,
+        Stars.StarFinderOptions finder, int searchRegion, int maxStars, double pixelScale, out int used)
+    {
+        used = 1;
+        if (!primaryReference.IsValid)
+        {
+            primaryReference = primary;
+            for (int i = 1; i < guideStars.Count && secondaries.Count < maxStars - 1; i++)
+            {
+                var s = new Stars.Star { Position = guideStars[i].Position };
+                if (guideStars[i].Position.IsValid && s.Find(frame, searchRegion, finder.FindMode, finder.MinHfd, finder.MaxHfd, finder.SaturationAdu))
+                {
+                    secondaries.Add(new Secondary(s, s.Position));
+                }
+            }
+
+            used += secondaries.Count;
+            return primary;
+        }
+
+        double px = primary.X - primaryReference.X, py = primary.Y - primaryReference.Y;
+        double sumX = px, sumY = py, sumW = 1;
+        double limit = Math.Max(2.0, 3.0 / (pixelScale > 0 ? pixelScale : 1.0));
+        foreach (var sec in secondaries)
+        {
+            if (!sec.Active || !sec.Star.Find(frame, searchRegion, finder.FindMode, finder.MinHfd, finder.MaxHfd, finder.SaturationAdu))
+            {
+                continue;
+            }
+
+            double dx = sec.Star.X - sec.Reference.X, dy = sec.Star.Y - sec.Reference.Y;
+            if (Math.Sqrt((dx - px) * (dx - px) + (dy - py) * (dy - py)) > limit)
+            {
+                sec.Active = false;
+                continue;
+            }
+
+            double w = primarySnr > 0 ? sec.Star.Snr / primarySnr : 1.0;
+            sumX += w * dx;
+            sumY += w * dy;
+            sumW += w;
+            used++;
+        }
+
+        return new GuidePoint(primaryReference.X + sumX / sumW, primaryReference.Y + sumY / sumW);
+    }
+
+    private sealed class Secondary(Stars.Star star, GuidePoint reference)
+    {
+        public Stars.Star Star { get; } = star;
+
+        public GuidePoint Reference { get; } = reference;
+
+        public bool Active { get; set; } = true;
+    }
 }

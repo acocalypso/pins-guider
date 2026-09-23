@@ -21,10 +21,10 @@ internal sealed record CoachFrame
     /// <summary>Primary position, camera px.</summary>
     public GuidePoint StarPosition { get; init; } = GuidePoint.Invalid;
 
-    /// <summary>Offset from the lock position in mount axes, px (RA = X, Dec = Y).</summary>
+    /// <summary>Offset from the lock position in mount axes, px (RA = X, Dec = Y): the multi-star combined offset the guider uses.</summary>
     public GuidePoint MountOffset { get; init; } = GuidePoint.Invalid;
 
-    /// <summary>Primary position transformed to mount axes, px (absolute; only differences are meaningful).</summary>
+    /// <summary>Combined star position (lock + offset) transformed to mount axes, px (absolute; only differences are meaningful).</summary>
     public GuidePoint MountPosition { get; init; } = GuidePoint.Invalid;
 
     public double Snr { get; init; }
@@ -76,7 +76,7 @@ internal sealed record CoachFrame
 internal interface ICoachFrameHook
 {
     /// <summary>
-    /// True: measurement mode — guiding output off, single-star tracking, frames excluded from statistics and safety
+    /// True: measurement mode — guiding output off, multi-star offsets as in guiding, frames excluded from statistics and safety
     /// monitors; pulses returned by <see cref="OnFrame"/> are issued. False: observe normal guiding (trials).
     /// </summary>
     bool SuspendsGuiding { get; }
