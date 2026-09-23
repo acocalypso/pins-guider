@@ -98,6 +98,9 @@ public sealed record GuiderSettings
     /// <summary>Consecutive guide-pulse failures before guiding fails.</summary>
     public int MaxPulseFailures { get; init; } = 3;
 
+    /// <summary>Analyse the guiding statistics while guiding and raise live coaching hints (<see cref="Coach.LiveHintAnalyser"/>).</summary>
+    public bool LiveHints { get; init; } = true;
+
     /// <summary>Downscaled image published with <see cref="FrameReadyEvent"/> every N frames (1 = every frame).</summary>
     public int FrameEventInterval { get; init; } = 1;
 
