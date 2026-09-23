@@ -193,3 +193,21 @@ Existing Start/Stop Guiding, Dither, Restore Guiding and RMS-based triggers work
 * `aduffeck/pins-guider` (this repo), later a submodule under `pins/NINA.Plugins/`.
 * PINS core changes: branch in `aduffeck/pins`. TNS plugin + frontend: branches in aduffeck forks.
 * Agents push only to aduffeck remotes. Upstream PRs, public mirrors and releases are human-owned.
+
+## 13. Changes after the pre-flight review (2026-09-23)
+
+Deliberate deviations from the sections above, made after a code review before the first night:
+
+* **Lost star (§5):** after the reacquire timeout the guider raises the critical alert once but keeps
+  searching (like PHD2) and resumes automatically when the star returns, instead of stopping. Reason: NINA
+  does not stop imaging when a guider stops, so a passing cloud would otherwise leave the rest of the night
+  unguided unless a Restore Guiding trigger exists. `SafetySettings.StopOnLostStarTimeout` restores the
+  original behaviour. No timer runs while guiding is paused.
+* **Reacquire:** full-frame reacquisition only accepts a candidate within 3× the search region of the last
+  position (never a different star elsewhere in the frame).
+* **Mount not responding:** judged on RA pulses only (Dec pulses are legitimately absorbed by backlash).
+* **Post-flip Dec:** besides the self-check, a Dec runaway within 15 minutes after a flip inverts Dec once
+  (alert + persisted setting) before a second runaway stops guiding.
+* **Already guiding:** StartGuiding without forced calibration returns immediately (PHD2 parity for NINA's
+  Restore Guiding trigger).
+* **Gain:** PHD2's gain (percent) is not used as fallback for the native INDI gain.

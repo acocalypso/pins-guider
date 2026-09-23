@@ -11,7 +11,8 @@ The native guider runs inside PINS (no PHD2 process). It appears in the guider c
   `indi_toupcam_ccd`). The main imaging camera may use any driver; the guide camera driver is loaded
   separately and never unloads the main camera's driver.
 * Mount connected in PINS with **pulse guiding** support (INDI, ASCOM/Alpaca…), or the guide camera's
-  **ST4** port (`PulseOutput = CameraST4`).
+  **ST4** port (`PulseOutput = CameraST4`; works without a mount connection, but then pier side and
+  declination are unknown — recalibrate after a meridian flip).
 
 ## 2. First-time setup (Touch-N-Stars)
 
@@ -23,10 +24,10 @@ The native guider runs inside PINS (no PHD2 process). It appears in the guider c
 | Setting | What to set | Default / fallback |
 |---|---|---|
 | `GuideCameraDriver` | INDI driver of the guide camera | `indi_asi_ccd` |
-| `GuideCameraDevice` | e.g. `ZWO CCD ASI120MM-S` (list via the camera picker) | empty = first camera of the driver that isn't the main camera |
+| `GuideCameraDevice` | e.g. `ZWO CCD ASI120MM-S` (list via the camera picker) | empty = the only camera of the driver that isn't the main camera (error if there are several — then set it) |
 | `FocalLengthMm` | guide scope focal length (main scope FL with an OAG) | PHD2 focal length from the profile, else unknown |
 | `ExposureSeconds` | 1–4 s typical | PHD2 exposure from the profile, else 2 s |
-| `Gain` | camera gain (−1 = leave as is) | PHD2 gain from the profile |
+| `Gain` | camera gain in the driver's native units (−1 = leave as is) | −1 (PHD2's gain is a percentage and is not carried over) |
 | `Binning` | 1 (2 for very long focal lengths) | 1 |
 | `DecGuideMode` | Auto / North / South / Off | PHD2 setting, else Auto |
 
@@ -68,12 +69,13 @@ curl "$H/set-setting?settingName=NativeSetting&newValue=MinSnr=8"          # any
 
 | Situation | What the guider does |
 |---|---|
-| Star lost (clouds, obstruction) | no corrections; searches near the last position, then full frame; gives up after 60 s (`ReacquireTimeoutSec`) → stops, notification |
+| Star lost (clouds, obstruction) | no corrections; searches near the last position, then full frame (only accepting a star near the old position); after 60 s (`ReacquireTimeoutSec`) a critical notification, then it **keeps searching** and resumes by itself when the star returns (`StopOnLostStarTimeout` in the engine stops instead) |
 | Corrections make the error grow / excessive pulse duty | **Runaway** → stops guiding, notification |
 | Large pulses without star movement | **Mount not responding** → stops, notification |
 | Mount slewing / parked / tracking off | pauses corrections, resumes afterwards; after a large move it waits for an explicit resume / restart |
 | Guide camera errors | retries 2×, reconnects once, then stops with a notification |
 | Calibration looks wrong (non-orthogonal, odd rates, few steps) | warning, guiding continues |
+| Dec runs away within 15 min after a meridian flip | Dec direction inverted once (and the *Reverse Dec after meridian flip* setting saved); a second runaway stops guiding |
 | Max pulse | hard limit per axis (`MaxRaDurationMs` / `MaxDecDurationMs`) |
 
 If your mount driver misreports *slewing* or *tracking*, turn off `PauseWhenSlewing` /
