@@ -48,7 +48,7 @@ internal sealed class NativeGuiderOptions
     [
         // Camera
         new("GuideCameraDriver", "Guide camera type", "Camera", "string", "indi_asi_ccd", Basic: true, RequiresReconnect: true,
-            Description: "Camera family of the guide camera (INDI driver). Choose 'simulator' for the built-in sky simulator."),
+            Description: "Camera family of the guide camera (its INDI driver), or the built-in simulator for testing without hardware."),
         new("GuideCameraDevice", "Guide camera", "Camera", "string", "", Basic: true, RequiresReconnect: true,
             Description: "The guide camera among the cameras of that type. Selected automatically when there is only one."),
         new("ExposureSeconds", "Exposure", "Camera", "double", "2", Basic: true, Unit: "s", Min: 0.01, Max: 30,
