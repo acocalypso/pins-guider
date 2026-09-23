@@ -45,7 +45,7 @@ public class CoachAnalysisTests
         a.RaDriftPxPerSec.Should().BeApproximately(0.02, 0.002);
         a.DecDriftPxPerSec.Should().BeApproximately(-0.01, 0.002);
         a.PeriodSeconds.Should().BeNull("a straight drift has no period");
-        a.GustFraction.Should().BeLessThan(0.02);
+        a.GustPercent.Should().BeLessThan(2);
     }
 
     [Test]
@@ -61,6 +61,14 @@ public class CoachAnalysisTests
         a.RaMaxRateArcsecPerSec.Should().BeApproximately(2 * (4 * w + 0.01), 0.1 * 2 * 4 * w);
         a.SeeingRaPx.Should().BeApproximately(0.3, 0.06, "the sinusoid does not leak into the seeing");
         a.DriftLimitingExposureSeconds.Should().BeApproximately(a.SeeingRaArcsec / a.RaMaxRateArcsecPerSec, 1e-9);
+
+        // the published model reproduces the samples (relative to the first one) up to the seeing:
+        // Ra(T) = offset + drift·T/60 + amplitude·sin(2πT/period + phase)
+        double RaModel(double t) => a.PeriodicOffsetArcsec!.Value + a.RaDriftArcsecPerMin * t / 60
+            + a.PeriodicAmplitudeArcsec * Math.Sin(2 * Math.PI * t / a.PeriodSeconds!.Value + a.PeriodicPhaseRad!.Value);
+        double rms = Math.Sqrt(samples.Average(x => Math.Pow((x.RaPx - samples[0].RaPx) * 2.0 - RaModel(x.T), 2)));
+        rms.Should().BeLessThan(1.2 * 0.3 * 2.0, "residuals are the 0.3 px seeing");
+        a.RaDriftArcsecPerMin.Should().BeApproximately(0.01 * 60 * 2.0, 0.3);
     }
 
     [Test]
@@ -97,7 +105,7 @@ public class CoachAnalysisTests
         // single-frame 4 px displacements on 5 of ~115 frames: each gives two jumps (into and out of the spike)
         var samples = Series(240, 2.1, _ => (0, 0), 0.2, spikes: i => i is 20 or 40 or 60 or 80 or 100 ? (4.0, 0) : (0, 0));
         var a = DriftAnalyzer.Analyze(samples, 2.0, 1.0, 0)!;
-        a.GustFraction.Should().BeInRange(0.05, 0.1);
+        a.GustPercent.Should().BeInRange(5, 10);
     }
 
     [Test]
@@ -185,7 +193,8 @@ public class CoachAnalysisTests
             {
                 r.BacklashState.Should().Be(CoachBacklashStates.Measured);
                 r.BacklashMs!.Value.Should().BeApproximately(backlashMs, 40, "the method has no systematic bias");
-                r.BacklashArcsec!.Value.Should().BeApproximately(backlashMs * mount.DecRate * mount.PixelScale, 0.2);
+                double arcsec = backlashMs * mount.DecRate * mount.PixelScale;
+                r.BacklashArcsec!.Value.Should().BeApproximately(arcsec, 0.05 * arcsec + 0.1);
             }
 
             r.BacklashPoints.Should().NotBeEmpty();
@@ -202,12 +211,15 @@ public class CoachAnalysisTests
     [Test]
     public void Response_procedure_detects_stiction_asymmetry_and_corrects_dec_drift()
     {
-        var mount = new KinematicDecMount { BacklashMs = 800, RaStictionMs = 200, EastEfficiency = 0.5, DecDriftPxPerSec = 0.03, NoisePx = 0.03 };
+        var mount = new KinematicDecMount { BacklashMs = 800, RaStictionMs = 200, EastEfficiency = 0.5, SouthEfficiency = 0.6, DecDriftPxPerSec = 0.03, NoisePx = 0.03 };
         var result = Run(mount, new MountResponseProcedure(0, mount.DecDriftPxPerSec, lostTimeoutSec: 30));
         var r = result.Response;
         r.MinEffectivePulseRaMs.Should().Be(1000, "200 ms stiction plus a half-speed East leaves 500 ms pulses below 50 %");
         r.AsymmetryRa!.Value.Should().BeApproximately(0.8 / 0.4, 0.2);
-        r.BacklashMs!.Value.Should().BeApproximately(800, 60, "the known Dec drift is removed");
+        // the dead band (800 ms at the North rate) takes 800 / 0.6 ms of the slower South pulses; the angle is the same
+        r.BacklashMs!.Value.Should().BeApproximately(800 / 0.6, 70, "the known Dec drift is removed and the slower South rate is measured");
+        r.BacklashArcsec!.Value.Should().BeApproximately(800 * mount.DecRate * mount.PixelScale, 0.4);
+        r.AsymmetryDec!.Value.Should().BeApproximately(1 / 0.6, 0.15);
         result.StarLost.Should().BeFalse();
     }
 
@@ -321,6 +333,8 @@ public class CoachAnalysisTests
 
         public double EastEfficiency { get; init; } = 1.0;
 
+        public double SouthEfficiency { get; init; } = 1.0;
+
         public double DecDriftPxPerSec { get; init; }
 
         public double NoisePx { get; init; }
@@ -349,9 +363,11 @@ public class CoachAnalysisTests
 
                 default:
                 {
-                    double take = Math.Min(p.DurationMs, play);
+                    // the motor turns slower South: the dead band takes longer to cross, the move is slower
+                    double motorMs = p.DurationMs * SouthEfficiency;
+                    double take = Math.Min(motorMs, play);
                     play -= take;
-                    Y -= DecRate * (p.DurationMs - take);
+                    Y -= DecRate * (motorMs - take);
                     break;
                 }
             }

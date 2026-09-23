@@ -81,12 +81,13 @@ internal sealed record MountResponseResult(CoachResponse Response, bool StarLost
 /// unbiased method, Dec pulse response per direction with the gear engaged, then a recenter towards the lock position.
 /// </summary>
 /// <remarks>
-/// <para>Backlash: pulse North with fixed pulses until two consecutive moves reach 70 % of the calibrated move (gear
-/// engaged North; their median gives the actual North rate r). Then pulse South with the same pulse P and record the
-/// drift-corrected Dec position y'ₖ after each pulse. Once two consecutive moves reach 80 % of the full move, the gear is
-/// engaged South and y'₀ − y'ₖ = r·(k·P − D) holds for those points, so the dead band is D = k·P − (y'₀ − y'ₖ)/r
-/// (averaged over the two points). Unlike PHD2's method (which compares against 90 % of the median North move and so
-/// underestimates by 10 % of the travel) this is unbiased; its noise is about √2·σ/r per point.</para>
+/// <para>Backlash: pulse North with fixed pulses P until two consecutive moves are substantial (≥ 40 % of the calibrated
+/// move) and agree within 35 % (gear engaged North). Then pulse South with the same P and record the drift-corrected Dec
+/// position y'ₖ after each pulse. Once three moves in a row are substantial and the last two agree, the motion started no
+/// later than pulse k−2, so the last two pulses moved at the full South rate r (their mean move / P, which may differ from
+/// the North rate) and y'₀ − y'ⱼ = r·(j·P − D) holds for j = k−1, k. The dead band is D = j·P − (y'₀ − y'ⱼ)/r, averaged
+/// over both points. Unlike PHD2's method (which compares against 90 % of the median North move and so underestimates by
+/// about 10 % of the travel) this is unbiased, also with asymmetric Dec rates.</para>
 /// <para>Each pulse is measured between the frame before and the frame after it, corrected for the linear drift measured
 /// in the Drift step. Pulses are capped at the max pulse durations and skipped when the star would get too close to the
 /// frame edge.</para>
@@ -95,8 +96,8 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
 {
     private const int MaxClearingPulses = 15;
     private const int MaxRecenterSteps = 10;
-    private const double ClearAcceptRatio = 0.7;
-    private const double FullRateRatio = 0.8;
+    /// <summary>A backlash-test move counts as motion when it reaches this fraction of the calibrated move.</summary>
+    private const double MoveRatio = 0.4;
 
     private readonly object gate = new();
     private readonly TaskCompletionSource<MountResponseResult> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -112,6 +113,7 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
     private readonly List<CoachPoint> backlashPoints = [];
     private readonly List<double> clearMoves = [];
     private readonly List<(double Y, double T)> southPositions = [];
+    private readonly List<double> southMoves = [];
 
     private Pending? pending;
     private DateTimeOffset? lostSince;
@@ -123,6 +125,7 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
     private int estimatedSteps;
     private string phase = "pulses";
     private CoachFrame? frame;
+    private PulseCommand? currentPulse;
     private IReadOnlyList<PulseCommand> next = [];
 
     // backlash state
@@ -131,11 +134,11 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
     private double backlashStartY;
     private bool backlashStartSet;
     private double? northRate;
+    private double? southRate;
     private double? backlashMs;
     private string backlashState = CoachBacklashStates.Skipped;
     private GuideDirection? lastDecDirection;
     private int clearCount;
-    private int consecutiveGood;
     private int recenterSteps;
     private DateTimeOffset? southStartTime;
 
@@ -164,6 +167,18 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
             lock (gate)
             {
                 return phase;
+            }
+        }
+    }
+
+    /// <summary>Last response pulse issued (for the step detail), null before the first one.</summary>
+    public PulseCommand? CurrentPulse
+    {
+        get
+        {
+            lock (gate)
+            {
+                return currentPulse;
             }
         }
     }
@@ -393,6 +408,7 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
         var f = frame!;
         double rate = dir.Axis() == GuideAxis.Ra ? f.Transform.XRate : f.Transform.YRate;
         double scale = f.PixelScale > 0 ? f.PixelScale : 1.0;
+        currentPulse = new PulseCommand(dir, ms);
         Issue(dir, ms, (_, moved, _) =>
         {
             double expected = ms * rate;
@@ -426,7 +442,7 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
         if (!(rate > 0))
         {
             backlashState = CoachBacklashStates.Unreliable;
-            plan.Enqueue(() => Engage(GuideDirection.South));
+            PrependEngage(GuideDirection.South);
             return;
         }
 
@@ -457,23 +473,15 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
         Issue(GuideDirection.North, backlashPulseMs, (after, moved, _) =>
         {
             AddBacklashPoint(after);
-            if (moved >= ClearAcceptRatio * backlashPulseMs * rate)
+            clearMoves.Add(moved);
+            int n = clearMoves.Count;
+            double min = MoveRatio * backlashPulseMs * rate;
+            if (n >= 2 && clearMoves[n - 1] >= min && clearMoves[n - 2] >= min && Consistent(clearMoves[n - 1], clearMoves[n - 2]))
             {
-                clearMoves.Add(moved);
-                consecutiveGood++;
-            }
-            else
-            {
-                consecutiveGood = 0;
-                clearMoves.Clear();
-            }
-
-            if (consecutiveGood >= 2)
-            {
-                // engaged North: measured North rate from the consistent moves
-                northRate = Median(clearMoves) / backlashPulseMs;
-                consecutiveGood = 0;
+                // engaged North: the actual North rate from the two consistent moves
+                northRate = (clearMoves[n - 1] + clearMoves[n - 2]) / 2 / backlashPulseMs;
                 southPositions.Clear();
+                southMoves.Clear();
                 PrependFirst(SouthStep);
             }
             else
@@ -486,14 +494,13 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
     private void SouthStep()
     {
         var f = frame!;
-        double r = northRate ?? f.Transform.YRate;
+        double rNorth = northRate ?? f.Transform.YRate;
         if (southPositions.Count == 0)
         {
             southPositions.Add((f.MountPosition.Y, 0));
         }
 
-        int k = southPositions.Count; // pulses issued so far + 1
-        if (k > MaxClearingPulses || !HasRoom(GuideDirection.South, backlashPulseMs))
+        if (southMoves.Count >= MaxClearingPulses || !HasRoom(GuideDirection.South, backlashPulseMs))
         {
             backlashState = CoachBacklashStates.Unreliable;
             PrependEngage(GuideDirection.South);
@@ -507,18 +514,22 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
             AddBacklashPoint(after);
             double t = (after.Time - origin).TotalSeconds;
             double y = after.MountPosition.Y - decDriftPxPerSec * t;
-            double prev = southPositions[^1].Y;
+            southMoves.Add(southPositions[^1].Y - y);
             southPositions.Add((y, t));
-            double move = prev - y;
-            consecutiveGood = move >= FullRateRatio * backlashPulseMs * r ? consecutiveGood + 1 : 0;
-            if (consecutiveGood >= 2)
+
+            // engaged South once three moves in a row are substantial and the last two agree: motion then started
+            // no later than pulse k-2, so pulses k-1 and k moved at the full South rate (which may differ from North)
+            int k = southMoves.Count;
+            double min = MoveRatio * backlashPulseMs * rNorth;
+            if (k >= 3 && southMoves[k - 3] >= min && southMoves[k - 2] >= min && southMoves[k - 1] >= min && Consistent(southMoves[k - 1], southMoves[k - 2]))
             {
-                int n = southPositions.Count - 1; // pulses issued
+                double rSouth = (southMoves[k - 1] + southMoves[k - 2]) / 2 / backlashPulseMs;
                 double y0 = southPositions[0].Y;
-                double d1 = n * backlashPulseMs - (y0 - southPositions[n].Y) / r;
-                double d2 = (n - 1) * backlashPulseMs - (y0 - southPositions[n - 1].Y) / r;
+                double d1 = k * backlashPulseMs - (y0 - southPositions[k].Y) / rSouth;
+                double d2 = (k - 1) * backlashPulseMs - (y0 - southPositions[k - 1].Y) / rSouth;
                 double d = (d1 + d2) / 2;
                 backlashMs = Math.Max(0, d);
+                southRate = rSouth;
                 backlashState = d >= 50 ? CoachBacklashStates.Measured : CoachBacklashStates.None;
             }
             else
@@ -527,6 +538,8 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
             }
         });
     }
+
+    private static bool Consistent(double a, double b) => Math.Max(a, b) <= 1.35 * Math.Min(a, b);
 
     /// <summary>Takes up the Dec gear slack in <paramref name="dir"/> before response pulses in that direction.</summary>
     private void Engage(GuideDirection dir)
@@ -630,7 +643,7 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
     private CoachResponse BuildResponse()
     {
         double scale = frame?.PixelScale is > 0 and var s ? s : 1.0;
-        double? rate = northRate ?? frame?.Transform.YRate;
+        double? rate = southRate ?? northRate ?? frame?.Transform.YRate;
         int? minRa = MountResponseAnalyzer.MinEffectivePulse(pulses, ra: true);
         int? minDec = MountResponseAnalyzer.MinEffectivePulse(pulses, ra: false);
         int raBasis = MountResponseAnalyzer.RateBasis(pulses, true, minRa);
@@ -654,12 +667,6 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
     }
 
     private static double? Round(double? v) => v is { } d ? Math.Round(d, 3) : null;
-
-    private static double Median(List<double> v)
-    {
-        var a = v.Order().ToArray();
-        return a.Length == 0 ? 0 : a.Length % 2 == 1 ? a[a.Length / 2] : (a[a.Length / 2 - 1] + a[a.Length / 2]) / 2;
-    }
 
     private sealed class Pending(Action<CoachFrame> complete)
     {

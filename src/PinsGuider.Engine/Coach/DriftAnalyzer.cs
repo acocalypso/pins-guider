@@ -50,6 +50,12 @@ public sealed record DriftAnalysis
 
     public double? PeriodicPhaseRad { get; init; }
 
+    /// <summary>
+    /// Offset of the fitted model relative to the first sample (arcsec). With a period, the RA samples (relative to the first
+    /// one) follow Ra(T) = offset + drift·T + amplitude·sin(2πT/period + phase), drift = <see cref="RaDriftArcsecPerMin"/>/60.
+    /// </summary>
+    public double? PeriodicOffsetArcsec { get; init; }
+
     public double PolarAlignmentErrorArcmin { get; init; }
 
     public bool DeclinationAssumed { get; init; }
@@ -57,7 +63,8 @@ public sealed record DriftAnalysis
     /// <summary>Longest exposure during which the RA drift stays below the RA seeing RMS; null without RA drift.</summary>
     public double? DriftLimitingExposureSeconds { get; init; }
 
-    public double GustFraction { get; init; }
+    /// <summary>Share of frame-to-frame jumps above 4 σ of the high-frequency jitter, 0..100.</summary>
+    public double GustPercent { get; init; }
 
     /// <summary>Min-move suggestion from the seeing, px.</summary>
     public double MinMoveRaPx { get; init; }
@@ -117,7 +124,8 @@ public static class DriftAnalyzer
         double seeingRa = HighFrequencyRms(ra, smoothRa, half);
         double seeingDec = HighFrequencyRms(dec, smoothDec, half);
 
-        var (raSlope, raIntercept) = LinearFit(t, ra);
+        var (lineSlope, raIntercept) = LinearFit(t, ra);
+        double raSlope = lineSlope;
         var (decSlope, _) = LinearFit(t, dec);
 
         // RA peak-to-peak of the smoothed motion (PHD2 uses a low-pass for the same purpose)
@@ -132,6 +140,9 @@ public static class DriftAnalyzer
         {
             peAmplitudePx = fit.Amplitude;
             maxRatePxPerSec = MaxSinusoidRate(fit);
+
+            // the drift of the PE model, so the published parameters reproduce the samples exactly
+            raSlope = fit.Slope;
         }
         else
         {
@@ -181,16 +192,17 @@ public static class DriftAnalyzer
             PeriodSeconds = pe?.Period,
             PeriodicAmplitudeArcsec = peAmplitudePx * scale,
             PeriodicPhaseRad = pe?.Phase,
+            PeriodicOffsetArcsec = pe is { } f2 ? (f2.Intercept - ra[0]) * scale : null,
             PolarAlignmentErrorArcmin = pae,
             DeclinationAssumed = decAssumed,
             DriftLimitingExposureSeconds = maxRateArcsec > 1e-6 ? seeingRaArcsec / maxRateArcsec : null,
-            GustFraction = gust,
+            GustPercent = gust * 100,
             MinMoveRaPx = Math.Round(raMinMove, 3),
             MinMoveDecPx = Math.Round(decMinMove, 3),
         };
     }
 
-    /// <summary>Fitted RA periodic error (px): x = c0 + c1·t + A·sin(2πt/P + φ).</summary>
+    /// <summary>Fitted RA periodic error (px): x = Intercept + Slope·t + Amplitude·sin(2πt/Period + Phase), t as given (seconds).</summary>
     public sealed record PeriodicFit(double Period, double Amplitude, double Phase, double Slope, double Intercept, double VarianceExplained);
 
     /// <summary>
@@ -206,8 +218,7 @@ public static class DriftAnalyzer
             return null;
         }
 
-        double t0 = t[0];
-        var tt = t.Select(v => v - t0).ToArray();
+        var tt = t.ToArray();
         var xx = x.ToArray();
         double sseLine = LineSse(tt, xx);
 
@@ -271,7 +282,7 @@ public static class DriftAnalyzer
             return null;
         }
 
-        // model: c2·sin(ωt) + c3·cos(ωt) = A·sin(ωt + φ) with t relative to the first sample
+        // model: c2·sin(ωt) + c3·cos(ωt) = A·sin(ωt + φ)
         double phase = Math.Atan2(c[3], c[2]);
         return new PeriodicFit(period, amplitude, phase, c[1], c[0], explained);
     }

@@ -41,8 +41,11 @@ public sealed record CoachStatus
     /// <summary>Failure/rejection/interruption reason (English), null otherwise.</summary>
     public string? Message { get; init; }
 
-    /// <summary>Stable code of <see cref="Message"/> (<see cref="CoachCodes"/>, e.g. coach.busy).</summary>
+    /// <summary>Stable code of <see cref="Message"/> (<see cref="CoachCodes"/>, e.g. coach.interrupted, coach.calibrationFailed).</summary>
     public string? MessageCode { get; init; }
+
+    /// <summary>Parameters of <see cref="MessageCode"/> (e.g. { "reason": "slew" }).</summary>
+    public Dictionary<string, object?> MessageParameters { get; init; } = new();
 
     public string? SessionId { get; init; }
 
@@ -92,8 +95,16 @@ public sealed record CoachStepStatus
     /// <summary><see cref="CoachStepStates"/>: Pending, Running, Done, Skipped or Failed.</summary>
     public string State { get; init; } = CoachStepStates.Pending;
 
-    /// <summary>Sub-phase, e.g. "exposure 2s gain 120", "calibrating", "backlash", "pulses", "trial B", "settling".</summary>
+    /// <summary>English sub-phase text (logs); UIs render <see cref="DetailCode"/>.</summary>
     public string? Detail { get; init; }
+
+    /// <summary>
+    /// Sub-phase code (<see cref="CoachDetailCodes"/>): camera.combination {exposureSeconds, gain, index, total}, calibrating,
+    /// drift.measuring, response.backlash, response.pulses {direction, ms}, trial.settling {id}, trial.running {id}; null when none.
+    /// </summary>
+    public string? DetailCode { get; init; }
+
+    public Dictionary<string, object?> DetailParameters { get; init; } = new();
 
     public double Progress { get; init; }
 
@@ -104,6 +115,24 @@ public sealed record CoachStepStatus
     public string? Message { get; init; }
 
     public string? MessageCode { get; init; }
+
+    public Dictionary<string, object?> MessageParameters { get; init; } = new();
+}
+
+/// <summary>Result of <see cref="GuidingCoach.Start"/> (AdvancedCoachStartResult).</summary>
+public sealed record CoachStartResult
+{
+    public bool Accepted { get; init; }
+
+    /// <summary>Rejection reason (English), its code (coach.busy, coach.notConnected, ...) and parameters; null when accepted.</summary>
+    public string? Message { get; init; }
+
+    public string? MessageCode { get; init; }
+
+    public Dictionary<string, object?> MessageParameters { get; init; } = new();
+
+    /// <summary>Status after the call: the new session when accepted, the unchanged status when rejected.</summary>
+    public required CoachStatus Status { get; init; }
 }
 
 public sealed record CoachCameraCheck
@@ -171,12 +200,19 @@ public sealed record CoachDrift
 
     public double? DecDriftArcsecPerMin { get; init; }
 
+    /// <summary>
+    /// Periodic error fit (null when the run is too short for a period). Model on the RA samples:
+    /// Ra(T) = PeriodicErrorOffsetArcsec + RaDriftArcsecPerMin·T/60 + PeriodicErrorAmplitudeArcsec·sin(2πT/PeriodicErrorPeriodSeconds + PeriodicErrorPhaseRad),
+    /// T = <see cref="CoachSample.T"/>.
+    /// </summary>
     public double? PeriodicErrorPeriodSeconds { get; init; }
 
-    /// <summary>Half peak-to-peak amplitude of the fitted sinusoid (or of the smoothed RA motion without a period), arcsec.</summary>
+    /// <summary>Amplitude (half peak-to-peak) of the fitted sinusoid; without a period half the peak-to-peak of the detrended smoothed RA motion, arcsec.</summary>
     public double? PeriodicErrorAmplitudeArcsec { get; init; }
 
     public double? PeriodicErrorPhaseRad { get; init; }
+
+    public double? PeriodicErrorOffsetArcsec { get; init; }
 
     public double? PolarAlignmentErrorArcmin { get; init; }
 
@@ -184,7 +220,8 @@ public sealed record CoachDrift
 
     public double? DriftLimitingExposureSeconds { get; init; }
 
-    public double? GustFraction { get; init; }
+    /// <summary>Share of frame-to-frame jumps larger than 4 σ of the high-frequency jitter (wind, gusts), 0..100.</summary>
+    public double? GustPercent { get; init; }
 }
 
 public sealed record CoachResponse
@@ -464,6 +501,18 @@ public static class CoachGuidedSources
     public const string Trials = "trials";
     public const string Window = "window";
     public const string None = "none";
+}
+
+/// <summary>Sub-phase codes of <see cref="CoachStepStatus.DetailCode"/>.</summary>
+public static class CoachDetailCodes
+{
+    public const string CameraCombination = "camera.combination";
+    public const string Calibrating = "calibrating";
+    public const string DriftMeasuring = "drift.measuring";
+    public const string ResponseBacklash = "response.backlash";
+    public const string ResponsePulses = "response.pulses";
+    public const string TrialSettling = "trial.settling";
+    public const string TrialRunning = "trial.running";
 }
 
 /// <summary>Values of the <c>reason</c> parameter of <see cref="CoachCodes.Interrupted"/>.</summary>

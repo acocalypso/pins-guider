@@ -24,7 +24,7 @@ public interface ICoachHost
     /// <summary>Stores a completed report (same <see cref="CoachReport.Id"/> = replace, e.g. after applying actions).</summary>
     void SaveReport(CoachReport report);
 
-    /// <summary>Stored reports, newest first.</summary>
+    /// <summary>Stored reports of the active profile, newest first.</summary>
     IReadOnlyList<CoachReport> LoadReports(int max);
 
     /// <summary>Declination override (degrees); null = from the mount state.</summary>
@@ -156,16 +156,22 @@ public sealed class SimpleCoachHost(Guider guider, string? reportDirectory = nul
         }
     }
 
+    /// <summary>Reports of the current <see cref="ProfileName"/> (all when it is null), newest first.</summary>
     public IReadOnlyList<CoachReport> LoadReports(int max)
     {
+        IEnumerable<CoachReport> all;
         if (store is not null)
         {
-            return store.Load(max);
+            all = store.Load(int.MaxValue);
+        }
+        else
+        {
+            lock (gate)
+            {
+                all = reports.Select(FileCoachReportStore.Normalize).ToList();
+            }
         }
 
-        lock (gate)
-        {
-            return reports.OrderByDescending(r => r.Timestamp).Take(max).Select(FileCoachReportStore.Normalize).ToList();
-        }
+        return all.Where(r => ProfileName is null || r.ProfileName == ProfileName).OrderByDescending(r => r.Timestamp).Take(max).ToList();
     }
 }

@@ -65,10 +65,12 @@ public static class CoachFindings
             CoachCodes.CameraNoDarks => "No dark library: hot pixels can be mistaken for stars. Build a dark library.",
             CoachCodes.DriftSeeing => $"Seeing (high-frequency star motion) is {V("rmsArcsec")}″ RMS ({V("level")}); guiding cannot beat this floor.",
             CoachCodes.DriftMinMove => $"Suggested min-move from the seeing: RA {V("raPx")} px, Dec {V("decPx")} px.",
-            CoachCodes.DriftPeriodicError => $"RA periodic error ±{V("amplitudeArcsec")}″ (period {V("periodSeconds", "0")} s), max rate {V("maxRateArcsecPerSec", "0.###")}″/s.",
-            CoachCodes.DriftExposureLimit => $"RA drifts more than the seeing within {V("seconds", "0.0")} s; the exposure is {V("currentSeconds", "0.0")} s.",
+            CoachCodes.DriftPeriodicError => p.TryGetValue("periodSeconds", out var period) && period is not null
+                ? $"RA periodic error ±{V("amplitudeArcsec")}″ with a period of {V("periodSeconds", "0")} s, max rate {V("maxRateArcsecPerSec", "0.###")}″/s."
+                : $"RA periodic error about ±{V("amplitudeArcsec")}″ (period longer than the measurement), max rate {V("maxRateArcsecPerSec", "0.###")}″/s.",
+            CoachCodes.DriftExposureLimit => $"Longest exposure before the RA drift exceeds the seeing: {V("seconds", "0.0")} s (current exposure {V("currentSeconds", "0.0")} s).",
             CoachCodes.DriftPolarAlignment => $"Polar alignment error about {V("arcmin", "0.0")}′ (Dec drift {V("driftArcsecPerMin")}″/min).",
-            CoachCodes.DriftWind => $"{Percent(p, "fraction")} of the frames show sudden jumps (wind, vibration).",
+            CoachCodes.DriftWind => $"{V("gustPercent", "0.#")} % of the frames show sudden jumps (wind, vibration).",
             CoachCodes.DriftDecGuideMode => $"Dec drifts steadily ({V("driftArcsecPerMin")}″/min) and backlash is large ({V("backlashMs", "0")} ms): guide Dec {V("mode")} only.",
             CoachCodes.ResponseDecBacklash => $"Dec backlash about {V("ms", "0")} ms ({V("arcsec", "0.0")}″).",
             CoachCodes.ResponseMinPulse => $"{V("axis")} pulses shorter than {V("ms", "0")} ms hardly move the mount (stiction).",
@@ -90,7 +92,4 @@ public static class CoachFindings
             _ => code,
         };
     }
-
-    private static string Percent(IReadOnlyDictionary<string, object?> p, string key) =>
-        p.TryGetValue(key, out var v) && v is double d ? (d * 100).ToString("0.#", Inv) + " %" : "?";
 }

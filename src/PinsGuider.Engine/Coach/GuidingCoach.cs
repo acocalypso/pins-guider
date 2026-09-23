@@ -88,50 +88,49 @@ public sealed class GuidingCoach
     }
 
     /// <summary>
-    /// Starts a session in the background. False when rejected: another session runs (status unchanged), or the guider is
-    /// busy/calibrating (<see cref="CoachCodes.Busy"/>) or the camera is not connected (<see cref="CoachCodes.NotConnected"/>),
-    /// then <see cref="Status"/> is Failed with the code.
+    /// Starts a session in the background. A rejection — another session runs or the guider is busy/calibrating
+    /// (<see cref="CoachCodes.Busy"/>), the camera is not connected (<see cref="CoachCodes.NotConnected"/>) — is reported only
+    /// in the result; the status of a running or the last session is left untouched.
     /// </summary>
-    public bool Start(CoachOptions? options = null)
+    public CoachStartResult Start(CoachOptions? options = null)
     {
         options ??= new CoachOptions();
+        string code;
         lock (gate)
         {
-            if (session is not null)
+            if (session is null)
             {
-                return false;
-            }
-
-            string? code = host.IsBusy || guider.State == GuiderState.Calibrating ? CoachCodes.Busy
-                : !guider.Camera.IsConnected ? CoachCodes.NotConnected
-                : null;
-            if (code is null)
-            {
-                var s = new Session(this, guider, host, Normalize(options));
-                if (guider.AttachCoach(s.OnInterrupt))
+                string? reason = host.IsBusy || guider.State == GuiderState.Calibrating ? CoachCodes.Busy
+                    : !guider.Camera.IsConnected ? CoachCodes.NotConnected
+                    : null;
+                if (reason is null)
                 {
-                    session = s;
-                    completion = Task.Run(s.RunAsync);
-                    return true;
+                    var s = new Session(this, guider, host, Normalize(options));
+                    if (guider.AttachCoach(s.OnInterrupt))
+                    {
+                        session = s;
+                        completion = Task.Run(s.RunAsync);
+                        return new CoachStartResult { Accepted = true, Status = s.CurrentStatus };
+                    }
+
+                    reason = CoachCodes.Busy;
                 }
 
+                code = reason;
+            }
+            else
+            {
                 code = CoachCodes.Busy;
             }
-
-            var (min, max, current) = GainRange();
-            lastStatus = new CoachStatus
-            {
-                Phase = CoachPhases.Failed,
-                MessageCode = code,
-                Message = CoachFindings.MessageFor(code, new Dictionary<string, object?>()),
-                GainMin = min,
-                GainMax = max,
-                CurrentGain = current,
-                CurrentExposureSeconds = guider.BaseSettings.ExposureMs / 1000.0,
-            };
-            guider.PublishEvent(new CoachStatusEvent(guider.Clock.UtcNow, lastStatus));
-            return false;
         }
+
+        return new CoachStartResult
+        {
+            Accepted = false,
+            MessageCode = code,
+            Message = CoachFindings.MessageFor(code, new Dictionary<string, object?>()),
+            Status = Status,
+        };
     }
 
     /// <summary>Skips the running step (its partial results are kept when usable). False when no step runs.</summary>
@@ -221,6 +220,12 @@ public sealed class GuidingCoach
         if (!host.ApplySettings(changes.Values.ToList(), out error))
         {
             return false;
+        }
+
+        foreach (var hint in hints.Where(h => appliedFindings.Contains(h.Id)))
+        {
+            // an applied hint has done its job
+            guider.DismissHint(hint.Id);
         }
 
         CoachFinding Mark(CoachFinding f) => appliedFindings.Contains(f.Id) ? f with { Applied = true } : f;
@@ -313,6 +318,10 @@ public sealed class GuidingCoach
 
         public string? Detail { get; set; }
 
+        public string? DetailCode { get; set; }
+
+        public Dictionary<string, object?> DetailParameters { get; set; } = new();
+
         public double Progress { get; set; }
 
         public DateTimeOffset? Started { get; set; }
@@ -324,6 +333,8 @@ public sealed class GuidingCoach
         public string? Message { get; set; }
 
         public string? Code { get; set; }
+
+        public Dictionary<string, object?> MessageParameters { get; set; } = new();
     }
 
     private sealed class Session
@@ -350,6 +361,7 @@ public sealed class GuidingCoach
         private StepState? current;
         private string? currentName;
         private bool calibrating;
+        private bool calibrationFailed;
         private CoachCameraResult? cameraRecommended;
         private DriftAnalysis? driftAnalysis;
         private CoachDrift? drift;
@@ -358,6 +370,7 @@ public sealed class GuidingCoach
         private string phase = CoachPhases.Running;
         private string? message;
         private string? messageCode;
+        private Dictionary<string, object?> messageParameters = new();
         private IReadOnlyList<CoachSettingChange>? cameraChanges;
         private DriftMeasurement? driftHook;
         private MountResponseProcedure? responseHook;
@@ -482,6 +495,7 @@ public sealed class GuidingCoach
                         phase = CoachPhases.Failed;
                         messageCode = failed!.Code;
                         message = failed.Message;
+                        messageParameters = new Dictionary<string, object?>(failed.MessageParameters);
                     }
                     else
                     {
@@ -504,7 +518,11 @@ public sealed class GuidingCoach
                     {
                         phase = CoachPhases.Cancelled;
                         messageCode = CoachCodes.Interrupted;
-                        message = CoachFindings.MessageFor(CoachCodes.Interrupted, new Dictionary<string, object?> { ["reason"] = reason });
+                        var p = new Dictionary<string, object?> { ["reason"] = reason };
+                        messageParameters = p;
+                        message = CoachFindings.MessageFor(CoachCodes.Interrupted, p);
+                        findings.Add(CoachFindings.Create(CoachCodes.Interrupted, current?.Name ?? currentName ?? CoachStepNames.Report, CoachSeverities.Problem,
+                            Now(), p));
                     }
                     else
                     {
@@ -550,6 +568,7 @@ public sealed class GuidingCoach
                     {
                         s.Message = message;
                         s.Code = messageCode;
+                        s.MessageParameters = new Dictionary<string, object?>(messageParameters);
                     }
                 }
 
@@ -686,7 +705,7 @@ public sealed class GuidingCoach
             }
             catch (StepFailedException f)
             {
-                EndStep(step, CoachStepStates.Failed, f.Code, f.Message);
+                EndStep(step, CoachStepStates.Failed, f.Code, f.Message, f.Parameters);
                 var p = new Dictionary<string, object?>(f.Parameters);
                 AddFinding(CoachFindings.Create(f.Code, step.Name, CoachSeverities.Problem, Now(), p, qualifier: step.Name));
             }
@@ -712,15 +731,18 @@ public sealed class GuidingCoach
             }
         }
 
-        private void EndStep(StepState step, string state, string? code = null, string? detail = null)
+        private void EndStep(StepState step, string state, string? code = null, string? detail = null, Dictionary<string, object?>? parameters = null)
         {
             lock (gate)
             {
                 step.State = state;
                 step.Progress = state == CoachStepStates.Failed ? step.Progress : 1.0;
                 step.Code = code;
-                step.Message = code is null ? null : detail ?? CoachFindings.MessageFor(code, new Dictionary<string, object?>());
+                step.MessageParameters = parameters is null ? new() : new Dictionary<string, object?>(parameters);
+                step.Message = code is null ? null : detail ?? CoachFindings.MessageFor(code, step.MessageParameters);
                 step.Detail = null;
+                step.DetailCode = null;
+                step.DetailParameters = new();
                 if (step.Started is { } s)
                 {
                     step.Elapsed = (clock.UtcNow - s).TotalSeconds;
@@ -734,7 +756,7 @@ public sealed class GuidingCoach
         {
             if (guider.IsLoopRunning)
             {
-                SetDetail("stopping");
+                SetDetail("stopping looping", null);
                 await guider.StopCaptureForCoachAsync().ConfigureAwait(false);
             }
 
@@ -756,6 +778,8 @@ public sealed class GuidingCoach
                     CheckMount();
                     var c = combos[i];
                     SetDetail(FormattableString.Invariant($"exposure {c.ExposureSeconds:0.##}s gain {(c.Gain is { } g ? g.ToString(CultureInfo.InvariantCulture) : "default")}"),
+                        CoachDetailCodes.CameraCombination,
+                        new() { ["exposureSeconds"] = c.ExposureSeconds, ["gain"] = c.Gain ?? -1, ["index"] = i + 1, ["total"] = combos.Count },
                         (double)i / combos.Count);
                     (IReadOnlyList<CameraFrameMeasurement> frames, int stars) measured;
                     try
@@ -936,7 +960,7 @@ public sealed class GuidingCoach
         {
             await ApplyOverlayAsync(cameraChanges).ConfigureAwait(false);
             await EnsureGuidingAsync(ct).ConfigureAwait(false);
-            SetDetail("measuring");
+            SetDetail("measuring drift", CoachDetailCodes.DriftMeasuring);
             var hook = new DriftMeasurement(options.DriftSeconds, LostTimeoutSec, h =>
             {
                 lock (gate)
@@ -958,19 +982,24 @@ public sealed class GuidingCoach
             var s = guider.BaseSettings;
             double smart = MinMove.SmartDefault(s.FocalLengthMm, s.PixelSizeUm > 0 ? s.PixelSizeUm : guider.Camera.PixelSizeUm, s.Binning);
             var analysis = DriftAnalyzer.Analyze(result.Samples, result.ExposureSeconds, result.PixelScale, host.DeclinationDeg ?? result.DeclinationDeg, smart);
-            if (analysis is null)
+            var dto = DriftDto(result, analysis, final: true);
+            lock (gate)
+            {
+                // partial results stay visible; findings and later steps only use complete measurements
+                drift = dto;
+            }
+
+            if (result.StarLost || analysis is null)
             {
                 throw new StepFailedException(result.StarLost ? CoachCodes.StarLost : CoachCodes.NoStar);
             }
 
-            var dto = DriftDto(result, analysis, final: true);
             lock (gate)
             {
                 driftAnalysis = analysis;
-                drift = dto;
             }
 
-            DriftFindings(analysis, result.ExposureSeconds);
+            DriftFindings(analysis, guider.BaseSettings.ExposureMs / 1000.0);
         }
 
         private CoachDrift DriftDto(DriftMeasurementResult? raw, DriftAnalysis? a, bool final, DriftMeasurement? live = null)
@@ -993,11 +1022,12 @@ public sealed class GuidingCoach
                 DecDriftArcsecPerMin = R(a?.DecDriftArcsecPerMin),
                 PeriodicErrorPeriodSeconds = R(a?.PeriodSeconds, 1),
                 PeriodicErrorAmplitudeArcsec = R(a?.PeriodicAmplitudeArcsec),
-                PeriodicErrorPhaseRad = R(a?.PeriodicPhaseRad),
+                PeriodicErrorPhaseRad = R(a?.PeriodicPhaseRad, 4),
+                PeriodicErrorOffsetArcsec = R(a?.PeriodicOffsetArcsec, 4),
                 PolarAlignmentErrorArcmin = R(a?.PolarAlignmentErrorArcmin, 2),
                 DeclinationAssumed = a?.DeclinationAssumed ?? false,
                 DriftLimitingExposureSeconds = R(a?.DriftLimitingExposureSeconds, 2),
-                GustFraction = R(a?.GustFraction),
+                GustPercent = R(a?.GustPercent, 2),
             };
         }
 
@@ -1039,10 +1069,10 @@ public sealed class GuidingCoach
                 new() { ["arcmin"] = Math.Round(pae, 2), ["decAssumed"] = a.DeclinationAssumed, ["driftArcsecPerMin"] = Math.Round(a.DecDriftArcsecPerMin, 3) },
                 pae >= 5 ? Math.Abs(a.DecDriftArcsecPerMin) / 60 * exposureSeconds / 2 + 0.02 * pae : null));
 
-            if (a.GustFraction > 0.02)
+            if (a.GustPercent > 2)
             {
                 AddFinding(CoachFindings.Create(CoachCodes.DriftWind, CoachStepNames.Drift, CoachSeverities.Warning, ts,
-                    new() { ["fraction"] = Math.Round(a.GustFraction, 3) }, null,
+                    new() { ["gustPercent"] = Math.Round(a.GustPercent, 1) }, null,
                     [Change(CoachSettingNames.RaMinMove, CoachSettingsMap.Format(Math.Round(a.MinMoveRaPx * 1.3, 2))),
                         Change(CoachSettingNames.DecMinMove, CoachSettingsMap.Format(Math.Round(a.MinMoveDecPx * 1.3, 2)))]));
             }
@@ -1063,7 +1093,15 @@ public sealed class GuidingCoach
                 lock (gate)
                 {
                     step.Progress = h.Progress;
-                    step.Detail = h.Phase;
+                    (step.Detail, step.DetailCode, step.DetailParameters) = h.Phase switch
+                    {
+                        "backlash" => ("measuring Dec backlash", CoachDetailCodes.ResponseBacklash, new Dictionary<string, object?>()),
+                        "recenter" => ("recentering", (string?)null, new Dictionary<string, object?>()),
+                        _ => h.CurrentPulse is { } cp
+                            ? ($"{cp.Direction} {cp.DurationMs} ms pulses", CoachDetailCodes.ResponsePulses,
+                                new Dictionary<string, object?> { ["direction"] = cp.Direction.ToString(), ["ms"] = cp.DurationMs })
+                            : ("pulses", CoachDetailCodes.ResponsePulses, new Dictionary<string, object?>()),
+                    };
                 }
 
                 Publish();
@@ -1081,7 +1119,7 @@ public sealed class GuidingCoach
                 response = result.Response;
             }
 
-            if (result.StarLost && result.Response.Pulses.Count == 0)
+            if (result.StarLost)
             {
                 throw new StepFailedException(CoachCodes.StarLost);
             }
@@ -1257,7 +1295,7 @@ public sealed class GuidingCoach
         private async Task RunTrialAsync(StepState step, int index, CoachTrial trial, CancellationToken ct, CancellationToken sessionCt)
         {
             UpdateTrial(index, t => t with { State = CoachTrialStates.Settling });
-            SetDetail("trial " + trial.Id + " settling");
+            SetDetail("trial " + trial.Id + " settling", CoachDetailCodes.TrialSettling, new() { ["id"] = trial.Id });
             await ApplyOverlayAsync(trial.Settings.Count == 0 ? null : trial.Settings).ConfigureAwait(false);
             await EnsureGuidingAsync(ct).ConfigureAwait(false);
             var settle = await guider.StartGuidingForCoachAsync(TrialSettle(), ct, coach.LoopToken).ConfigureAwait(false);
@@ -1268,7 +1306,7 @@ public sealed class GuidingCoach
             }
 
             UpdateTrial(index, t => t with { State = CoachTrialStates.Running });
-            SetDetail("trial " + trial.Id);
+            SetDetail("trial " + trial.Id + " guiding", CoachDetailCodes.TrialRunning, new() { ["id"] = trial.Id });
             var observer = new TrialObserver(options.TrialSeconds, LostTimeoutSec, h =>
             {
                 var stats = h.CurrentStatistics();
@@ -1608,13 +1646,26 @@ public sealed class GuidingCoach
                 throw new StepFailedException(CoachCodes.NoCalibration);
             }
 
+            if (guider.Calibration is null && calibrationFailed)
+            {
+                // don't repeat a failed calibration for every step
+                throw new StepFailedException(CoachCodes.CalibrationFailed);
+            }
+
             if (guider.State == GuiderState.Failed || !guider.IsLoopRunning)
             {
                 // a loop that just ended (e.g. after a trial runaway) must finish before it is restarted
                 await guider.WaitForLoopAsync().ConfigureAwait(false);
             }
 
-            SetDetail(guider.Calibration is null ? "calibrating" : "starting");
+            if (guider.Calibration is null)
+            {
+                SetDetail("calibrating", CoachDetailCodes.Calibrating);
+            }
+            else
+            {
+                SetDetail("starting guiding", null);
+            }
             var result = await guider.StartGuidingForCoachAsync(QuickSettle, ct, coach.LoopToken).ConfigureAwait(false);
             ct.ThrowIfCancellationRequested();
             lock (gate)
@@ -1636,6 +1687,11 @@ public sealed class GuidingCoach
                 GuideErrorCode.CameraFailed or GuideErrorCode.CameraCaptureFailed => CoachCodes.CameraError,
                 _ => CoachCodes.Internal,
             };
+            if (code == CoachCodes.CalibrationFailed)
+            {
+                calibrationFailed = true;
+            }
+
             throw new StepFailedException(code, result.Error);
         }
 
@@ -1772,13 +1828,15 @@ public sealed class GuidingCoach
             Publish();
         }
 
-        private void SetDetail(string detail, double? progress = null)
+        private void SetDetail(string detail, string? code, Dictionary<string, object?>? parameters = null, double? progress = null)
         {
             lock (gate)
             {
                 if (current is { } c)
                 {
                     c.Detail = detail;
+                    c.DetailCode = code;
+                    c.DetailParameters = parameters ?? new();
                     if (progress is { } p)
                     {
                         c.Progress = p;
@@ -1865,6 +1923,7 @@ public sealed class GuidingCoach
                     Phase = phase,
                     Message = message,
                     MessageCode = messageCode,
+                    MessageParameters = new Dictionary<string, object?>(messageParameters),
                     SessionId = id,
                     StartedAt = startedAt.UtcDateTime,
                     Step = running ? (calibrating ? CoachStepNames.Calibrating : currentName) : null,
@@ -1873,11 +1932,14 @@ public sealed class GuidingCoach
                         Name = x.Name,
                         State = x.State,
                         Detail = x.Detail,
+                        DetailCode = x.DetailCode,
+                        DetailParameters = new Dictionary<string, object?>(x.DetailParameters),
                         Progress = Math.Round(x.Progress, 3),
                         ElapsedSeconds = Math.Round(x.State == CoachStepStates.Running && x.Started is { } st ? (now - st).TotalSeconds : x.Elapsed, 1),
                         EstimatedSeconds = Math.Round(x.Estimated),
                         Message = x.Message,
                         MessageCode = x.Code,
+                        MessageParameters = new Dictionary<string, object?>(x.MessageParameters),
                     }).ToList(),
                     Progress = phase == CoachPhases.Complete ? 1.0 : total > 0 ? Math.Round(done / total, 3) : 0,
                     ElapsedSeconds = Math.Round((now - startedAt).TotalSeconds, 1),
