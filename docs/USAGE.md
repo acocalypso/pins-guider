@@ -6,7 +6,7 @@ The native guider runs inside PINS (no PHD2 process). It appears in the guider c
 ## 1. Requirements
 
 * PINS image built with the `pins-guider` plugin and the `IAdvancedGuider` core contract
-  (branch `feat/native-guider` of `aduffeck/pins`, see [Deployment](#6-deployment)).
+  (branch `feat/native-guider` of `aduffeck/pins`, see [Deployment](#7-deployment)).
 * Guide camera with an **INDI driver** (e.g. `indi_asi_ccd` for ZWO, `indi_qhy_ccd`, `indi_playerone_ccd`,
   `indi_toupcam_ccd`). The main imaging camera may use any driver; the guide camera driver is loaded
   separately and never unloads the main camera's driver.
@@ -81,17 +81,40 @@ curl "$H/set-setting?settingName=NativeSetting&newValue=MinSnr=8"          # any
 If your mount driver misreports *slewing* or *tracking*, turn off `PauseWhenSlewing` /
 `PauseWhenTrackingOff`.
 
-## 5. Files
+## 5. Guiding Coach
+
+The **Coach** tab on the Guiding page measures your rig under tonight's sky, explains what limits your guiding and
+recommends settings — and proves them with short guided trials. A full session takes about 15 minutes; pick steps
+to make it shorter. Design details: [COACH.md](COACH.md).
+
+1. **Camera check** — loops exposure × gain combinations (guiding stopped) and recommends the combination with the
+   lowest centroid noise that doesn't saturate the star.
+2. **Sky & mount drift** — 3 minutes with guiding output off: seeing, periodic error, RA/Dec drift, polar alignment
+   error, wind gusts, longest useful exposure. Calibrates first if needed.
+3. **Mount response** — Dec backlash, smallest pulse that moves the mount, direction asymmetry, guide rate check.
+4. **Guided trials** — guides ~2 minutes each with your current settings, the coach's suggestion and a variant
+   (and your settings again to detect changing conditions). Your settings are restored afterwards.
+5. **Report card** — grade relative to your imaging scale (camera pixel size + telescope focal length from the
+   profile), error budget (seeing / centroid noise / mount), ranked actions with *Apply* buttons, and a per-night
+   history (per profile).
+
+Guiding that was running when the coach started is resumed with your original settings when it ends — also on
+cancel or errors. Starting/stopping guiding, dithering or a slew (e.g. from a running sequence) interrupts the
+session. While guiding normally, the guider shows occasional **hints** (e.g. RA oscillating → lower aggression) as a
+dismissable chip in the status strip; `LiveHints` in the engine settings is on by default.
+
+## 6. Files
 
 * Guide logs (PHD2 format, open with PHD2 Log Viewer): `~/.local/share/NINA/NativeGuider/Logs/PinsGuider_GuideLog_<night>.txt`
   (one file per night, noon to noon)
 * Calibrations: `~/.local/share/NINA/NativeGuider/calibrations.json`
 * Dark libraries: `~/.local/share/NINA/NativeGuider/Darks/`
+* Guiding Coach reports: `~/.local/share/NINA/NativeGuider/Coach/coach-*.json`
 * PINS log (search for `NativeGuider`): `~/.local/share/NINA/Logs/`
 
 In the docker setup `~` is `./data/home` on the host.
 
-## 6. Deployment
+## 7. Deployment
 
 Build the image from the `aduffeck/pins` branch `feat/native-guider` with local plugin and web app sources:
 
@@ -102,7 +125,7 @@ docker build --network host --build-context local-plugins=NINA.Plugins --build-c
   -t aduffeck/pins:native-guider .
 ```
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
 * *"Guide camera '…' not found"* — the message lists the devices the driver offers; set `GuideCameraDevice`
   to one of them (or clear it for auto-selection).
@@ -110,4 +133,6 @@ docker build --network host --build-context local-plugins=NINA.Plugins --build-c
 * *Calibration failed: RA did not move* — check the guide output (mount driver pulse guiding / ST4 cable),
   guide rate and that the mount tracks.
 * Arcsec values look wrong — set `FocalLengthMm`.
+* The guide frame is white/says *saturated* — the sky is still too bright or exposure/gain are too high (a 12-bit
+  camera like the ASI120 saturates at 65520 ADU); reduce exposure or gain, or wait for darkness.
 * Back to PHD2: select PHD2 in the guider chooser; nothing else changes.

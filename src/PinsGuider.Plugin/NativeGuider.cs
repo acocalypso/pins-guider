@@ -11,6 +11,7 @@ using NINA.Equipment.Interfaces;
 using NINA.Equipment.Interfaces.Mediator;
 using NINA.Profile.Interfaces;
 using PinsGuider.Engine.Calibration;
+using PinsGuider.Engine.Coach;
 using PinsGuider.Engine.Core;
 using PinsGuider.Engine.Guiding;
 using PinsGuider.Engine.Logging;
@@ -40,8 +41,10 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
     private readonly LinkedList<AdvancedGuideStep> steps = new();
     private readonly LinkedList<AdvancedGuiderAlert> alerts = new();
     private readonly SemaphoreSlim connectLock = new(1, 1);
+    private readonly NativeCoachHost coachHost;
 
     private Guider? guider;
+    private GuidingCoach? coach;
     private IndiGuideCamera? indiCamera;
     private Simulator? simulator;
     private IMountState? mountState;
@@ -72,6 +75,7 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
         this.telescopeMediator = telescopeMediator;
         this.cameraMediator = cameraMediator;
         options = new NativeGuiderOptions(profileService, pluginId);
+        coachHost = new NativeCoachHost(profileService, options, TrySetSetting, SettleFromProfile, () => buildingDarks);
         profileService.ProfileChanged += (_, _) => ApplySettingsIfConnected();
     }
 
@@ -210,6 +214,7 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
         var g = new Guider(camera, output, mountState, SystemClock.Instance, settings);
         g.EventRaised += OnEngineEvent;
         guider = g;
+        coach = new GuidingCoach(g, coachHost);
         cameraSource = camera;
         PixelScale = g.PixelScale;
         LoadDarks();
@@ -228,6 +233,22 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
 
     private async Task CleanupAsync()
     {
+        var c = coach;
+        coach = null;
+        if (c is { IsRunning: true })
+        {
+            // let the session restore its temporary settings before the camera goes away
+            c.Cancel();
+            try
+            {
+                await c.Completion.WaitAsync(TimeSpan.FromSeconds(10)).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Logger.Debug($"NativeGuider: coach cancel: {ex.Message}");
+            }
+        }
+
         var g = guider;
         guider = null;
         if (g is not null)
@@ -469,6 +490,8 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
                 LastError = lastError,
                 SettleStatus = settleStatus,
                 DarkLibrary = darkLibrary,
+                Hints = g?.ActiveHints.Select(CoachMapping.ToDto).ToList() ?? [],
+                CoachRunning = coach?.IsRunning ?? false,
             };
         }
     }
@@ -644,9 +667,9 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
             return false;
         }
 
-        if (g.State.IsCapturing() || buildingDarks)
+        if (g.State.IsCapturing() || buildingDarks || coach?.IsRunning == true)
         {
-            Notification.ShowError("Native guider: stop guiding/looping before building a dark library");
+            Notification.ShowError("Native guider: stop guiding/looping (and the Guiding Coach) before building a dark library");
             return false;
         }
 
@@ -700,6 +723,73 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
             buildingDarks = false;
         }
     }
+
+    public Task<AdvancedCoachStartResult> StartCoach(AdvancedCoachOptions options, CancellationToken ct)
+    {
+        var c = coach;
+        if (c is null || !Connected)
+        {
+            return Task.FromResult(new AdvancedCoachStartResult
+            {
+                Accepted = false,
+                Message = "The guider is not connected",
+                MessageCode = CoachCodes.NotConnected,
+                Status = GetCoachStatus(),
+            });
+        }
+
+        var result = c.Start(CoachMapping.FromDto(options));
+        if (result.Accepted)
+        {
+            Logger.Info($"NativeGuider: Guiding Coach session {result.Status.SessionId} started ({string.Join(", ", result.Status.Steps.Select(s => s.Name))})");
+        }
+        else
+        {
+            Logger.Info($"NativeGuider: Guiding Coach start rejected: {result.MessageCode} {result.Message}");
+        }
+
+        return Task.FromResult(CoachMapping.ToDto(result));
+    }
+
+    public Task<bool> SkipCoachStep(CancellationToken ct) => Task.FromResult(coach?.SkipStep() ?? false);
+
+    public Task<bool> CancelCoach(CancellationToken ct) => Task.FromResult(coach?.Cancel() ?? false);
+
+    public AdvancedCoachStatus GetCoachStatus()
+    {
+        var c = coach;
+        if (c is not null)
+        {
+            return CoachMapping.ToDto(c.Status);
+        }
+
+        return new AdvancedCoachStatus { Phase = CoachPhases.Idle, CurrentExposureSeconds = options.ToEngineSettings().ExposureMs / 1000.0 };
+    }
+
+    public Task<bool> ApplyCoachActions(IList<string> ids, CancellationToken ct)
+    {
+        var c = coach;
+        if (c is null || ids is null || ids.Count == 0)
+        {
+            return Task.FromResult(false);
+        }
+
+        if (!c.ApplyActions(ids.ToList(), out var error))
+        {
+            Logger.Warning($"NativeGuider: coach actions not applied: {error}");
+            return Task.FromResult(false);
+        }
+
+        return Task.FromResult(true);
+    }
+
+    public IList<AdvancedCoachReport> GetCoachHistory(int max)
+    {
+        var reports = coach?.GetHistory(Math.Max(0, max)) ?? coachHost.LoadReports(Math.Max(0, max));
+        return reports.Select(r => CoachMapping.ToDto(r)!).ToList();
+    }
+
+    public bool DismissHint(string id) => guider?.DismissHint(id) ?? false;
 
     private void LoadDarks()
     {
@@ -832,8 +922,23 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
         {
             switch (e)
             {
+                case GuideStepEvent { CoachMeasurement: true } s:
+                    // coach measurement frame (guiding output off): not a guide step for NINA or the guide graph
+                    lock (sync)
+                    {
+                        lastStep = s;
+                    }
+
+                    break;
                 case GuideStepEvent s:
                     OnGuideStep(s);
+                    break;
+                case CoachStatusEvent cs:
+                    Raise("coach", e.Timestamp, CoachMapping.ToDto(cs.Status));
+                    break;
+                case CoachHintEvent ch:
+                    Logger.Info($"NativeGuider: hint {ch.Hint.Code}: {ch.Hint.Message}");
+                    Raise("hint", e.Timestamp, CoachMapping.ToDto(ch.Hint));
                     break;
                 case AppStateEvent st:
                     if (st.State is not GuiderState.Calibrating)
