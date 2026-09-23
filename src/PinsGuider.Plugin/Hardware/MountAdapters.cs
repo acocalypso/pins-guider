@@ -16,10 +16,21 @@ internal sealed class NinaMountState(ITelescopeMediator telescope, Func<bool>? p
     bool mountOptional = false) : IMountState
 {
     public const double SiderealArcsecPerSec = 15.041;
+    private const int MaxLoggedChanges = 30;
+
+    private bool? lastSlewing;
+    private bool? lastTracking;
+    private DateTimeOffset logWindowStart = DateTimeOffset.MinValue;
+    private int loggedChanges;
 
     public MountSnapshot GetSnapshot()
     {
         var info = telescope.GetInfo();
+        if (info is { Connected: true })
+        {
+            LogStateChange(info);
+        }
+
         if (info is null || !info.Connected)
         {
             // ST4 guiding works without a mount connection; pier side/declination are then unknown
@@ -48,6 +59,46 @@ internal sealed class NinaMountState(ITelescopeMediator telescope, Func<bool>? p
             GuideRateRa = Rate(info.GuideRateRightAscensionArcsecPerSec),
             GuideRateDec = Rate(info.GuideRateDeclinationArcsecPerSec),
         };
+    }
+
+    /// <summary>
+    /// Logs every change of the driver's slewing/tracking flags (at most 30 per 10 minutes): drivers that report a slew
+    /// around guide pulses pause guiding, and the log shows what the driver reported.
+    /// </summary>
+    private void LogStateChange(NINA.Equipment.Equipment.MyTelescope.TelescopeInfo info)
+    {
+        if (lastSlewing == info.Slewing && lastTracking == info.TrackingEnabled)
+        {
+            return;
+        }
+
+        bool first = lastSlewing is null;
+        lastSlewing = info.Slewing;
+        lastTracking = info.TrackingEnabled;
+        if (first)
+        {
+            return;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        if (now - logWindowStart > TimeSpan.FromMinutes(10))
+        {
+            logWindowStart = now;
+            loggedChanges = 0;
+        }
+
+        if (++loggedChanges > MaxLoggedChanges)
+        {
+            if (loggedChanges == MaxLoggedChanges + 1)
+            {
+                Logger.Info("NativeGuider: further mount slewing/tracking changes are not logged for 10 minutes");
+            }
+
+            return;
+        }
+
+        Logger.Info(FormattableString.Invariant(
+            $"NativeGuider: mount reports slewing={info.Slewing} tracking={info.TrackingEnabled} pulseGuiding={info.IsPulseGuiding} parked={info.AtPark} RA={info.RightAscension:F5}h Dec={info.Declination:F4}°"));
     }
 }
 
