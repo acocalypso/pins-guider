@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/PinsGuider.Engine/PinsGuider.Engine.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/PinsGuider.Engine.Tests/PinsGuider.Engine.Tests.csproj" />
+  </Folder>
+</Solution>
