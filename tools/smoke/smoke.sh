@@ -111,7 +111,9 @@ else
   res 0 "coach apply action" "no action with setting changes in this run"
 fi
 wait $WSCPID; grep -q '"coach"' $D/ws-coach.txt; res $? "coach websocket events" "$(cat $D/ws-coach.txt)"
-python3 $(dirname "$0")/shot.py $TNS $D Coach >/dev/null 2>&1; [ -s $D/ui-desktop-coach.png ]; res $? "Coach tab screenshots" "$D/ui-desktop-coach.png $D/ui-phone-coach.png"
+# headless Chrome can't reach the published port here; browse via the container's bridge IP
+CIP=$(docker inspect $C --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+shot=$(timeout 150 python3 $(dirname "$0")/shot.py "http://$CIP:5000" $D Coach 2>&1); [ "$(echo "$shot" | grep -c 'tab clicked')" -eq 2 ]; res $? "Coach tab screenshots" "$D/ui-desktop-coach.png $D/ui-phone-coach.png"
 google-chrome --headless=new --no-sandbox --disable-gpu --hide-scrollbars --window-size=1366,1000 --virtual-time-budget=20000 --screenshot=$D/ui-desktop.png "$TNS/guider" >/dev/null 2>&1
 google-chrome --headless=new --no-sandbox --disable-gpu --hide-scrollbars --window-size=390,900 --virtual-time-budget=20000 --screenshot=$D/ui-phone.png "$TNS/guider" >/dev/null 2>&1
 [ -s $D/ui-desktop.png ]; res $? "UI screenshots" "$D/ui-desktop.png $D/ui-phone.png"
