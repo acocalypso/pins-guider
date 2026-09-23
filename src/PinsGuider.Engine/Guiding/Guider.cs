@@ -373,7 +373,18 @@ public sealed class Guider : IAsyncDisposable
     });
 
     /// <summary>Use a stored calibration (e.g. from <see cref="CalibrationStore"/>); it is adjusted for the current pointing when guiding starts.</summary>
-    public void LoadCalibration(CalibrationData data) => Post(() =>
+    public void LoadCalibration(CalibrationData data)
+    {
+        Post(() => LoadCalibrationCore(data));
+
+        // no loop to apply it: apply now so hosts/UIs see the stored calibration before guiding starts
+        if (!IsLoopRunning)
+        {
+            DrainCommands();
+        }
+    }
+
+    private void LoadCalibrationCore(CalibrationData data)
     {
         if (state.IsGuidingActive() || state == GuiderState.Calibrating)
         {
@@ -384,7 +395,7 @@ public sealed class Guider : IAsyncDisposable
         calibration = data;
         adjustment = null;
         transform = null;
-    });
+    }
 
     /// <summary>Set the lock position explicitly (PHD2 set_lock_position).</summary>
     public void SetLockPosition(GuidePoint position) => Post(() =>

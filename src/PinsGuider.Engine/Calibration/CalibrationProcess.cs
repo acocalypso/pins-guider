@@ -258,6 +258,8 @@ public sealed class CalibrationProcess
         }
 
         calibrationSteps = 0;
+        points.Clear();
+        points.Add(new CalibrationPoint("Start", 0, currentLocation.X, currentLocation.Y));
         calibrationInitialLocation = currentLocation;
         calibrationStartingLocation = GuidePoint.Invalid;
         calibrationStartingCoords = GuidePoint.Invalid;
@@ -793,6 +795,7 @@ public sealed class CalibrationProcess
                     DecStepCount = decStepCount,
                     RaSteps = raSteps.ToArray(),
                     DecSteps = decSteps.ToArray(),
+                    Points = points.Concat(logged.Select(ToPoint)).ToArray(),
                     CalibrationStepMs = StepMs,
                     CalibrationDistancePx = DistancePx,
                 };
@@ -807,6 +810,7 @@ public sealed class CalibrationProcess
             }
         }
 
+        points.AddRange(logged.Select(ToPoint));
         return new CalibrationUpdate
         {
             State = State,
@@ -821,6 +825,10 @@ public sealed class CalibrationProcess
             EstimatedTotalSteps = EstimateTotal(),
         };
     }
+
+    private readonly List<CalibrationPoint> points = [];
+
+    private static CalibrationPoint ToPoint(CalibrationStepInfo s) => new(s.Direction, s.StepNumber, s.Position.X, s.Position.Y);
 
     private CalibrationUpdate Fail(CalibrationErrorCode code, string reason, IReadOnlyList<CalibrationStepInfo> logged)
     {

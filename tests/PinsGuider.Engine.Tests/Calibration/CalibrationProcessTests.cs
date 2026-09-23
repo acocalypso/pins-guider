@@ -63,6 +63,24 @@ public class CalibrationProcessTests
     }
 
     [Test]
+    public void CompletedCalibrationCarriesEveryStepPosition()
+    {
+        var m = new KinematicMount { DeclinationDeg = 10.0, DecBacklashMs = 1500 };
+        var (_, updates) = CalibrationRunner.Run(m);
+        CalibrationData cal = updates[^1].Result!;
+
+        var dirs = cal.Points.Select(p => p.Direction).ToList();
+        dirs[0].Should().Be("Start");
+        dirs.Should().ContainInOrder("Start", "West", "East", "Backlash", "North", "South");
+        // PHD2 also logs the West step that reaches the distance limit
+        dirs.Count(d => d == "West").Should().BeGreaterThanOrEqualTo(cal.RaStepCount);
+        var start = cal.Points[0];
+        var lastWest = cal.Points.Last(p => p.Direction == "West");
+        Math.Sqrt(Math.Pow(lastWest.X - start.X, 2) + Math.Pow(lastWest.Y - start.Y, 2)).Should().BeGreaterThanOrEqualTo(cal.CalibrationDistancePx);
+        cal.Points.Should().OnlyHaveUniqueItems();
+    }
+
+    [Test]
     public void OddParitiesFromMountCoordinates()
     {
         var m = new KinematicMount { OddRaParity = true, OddDecParity = true };

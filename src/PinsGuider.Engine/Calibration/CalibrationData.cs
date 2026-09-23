@@ -78,6 +78,12 @@ public sealed record CalibrationData
     /// <summary>Star displacement (start - current, px) logged at each Dec calibration step (North then South).</summary>
     public IReadOnlyList<GuidePoint> DecSteps { get; init; } = [];
 
+    /// <summary>
+    /// Star position after every calibration step (camera px), in order: "Start", then "West", "East", "Backlash",
+    /// "North", "South", "NudgeSouth" legs. For plotting the calibration like KStars; empty for older calibrations.
+    /// </summary>
+    public IReadOnlyList<CalibrationPoint> Points { get; init; } = [];
+
     /// <summary>Calibration pulse duration used, ms.</summary>
     public int CalibrationStepMs { get; init; }
 
@@ -91,3 +97,10 @@ public sealed record CalibrationData
     [JsonIgnore]
     public double OrthogonalityErrorDeg => MountTransform.OrthogonalityErrorDegrees(XAngle, YAngle);
 }
+
+/// <summary>Star position recorded after a calibration step.</summary>
+/// <param name="Direction">Start, West, East, Backlash, North, South or NudgeSouth.</param>
+/// <param name="Step">Step number within the leg.</param>
+/// <param name="X">Star x (camera px).</param>
+/// <param name="Y">Star y (camera px).</param>
+public sealed record CalibrationPoint(string Direction, int Step, double X, double Y);

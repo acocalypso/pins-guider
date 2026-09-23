@@ -540,6 +540,7 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
             DecSteps = cal.DecStepCount,
             LastIssue = cal.LastIssue.ToString(),
             DecFlipRequired = options.GetBool("DecFlipRequired"),
+            Points = cal.Points.Select(p => new AdvancedCalibrationPoint { Direction = p.Direction, Step = p.Step, X = p.X, Y = p.Y }).ToList(),
         };
     }
 
