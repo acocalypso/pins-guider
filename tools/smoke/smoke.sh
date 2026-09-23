@@ -56,6 +56,62 @@ r=$(curl -s $TNS/api/native-guider/calibration); echo "$r" | jq -e '.response.ra
 r=$(curl -s -X POST "$TNS/api/native-guider/dither?pixels=3"); echo "$r" | jq -e '.success==true' >/dev/null; res $? "dither" "$(echo "$r" | jq -c .response)"
 sleep 40
 r=$(curl -s "$TNS/api/native-guider/alerts?max=50"); echo "$r" | jq -e '.success==true' >/dev/null; res $? "alerts" "$(echo "$r" | jq -c '[.response[].codeName]')"
+
+# --- Guiding Coach: short session while guiding (camera check, drift, mount response, trials) ---
+r=$(curl -s $TNS/api/native-guider/coach); echo "$r" | jq -e '.response.phase == "Idle" and .response.gainMax > .response.gainMin' >/dev/null; res $? "coach idle + gain range" "$(echo "$r" | jq -c '.response|{phase,gainMin,gainMax,currentGain,currentExposureSeconds}')"
+python3 - <<'PY' > $D/ws-coach.txt 2>&1 &
+import asyncio, json, websockets, collections
+async def main():
+    c = collections.Counter()
+    async with websockets.connect("ws://127.0.0.1:35000/ws/native-guider") as ws:
+        try:
+            async with asyncio.timeout(1300):
+                while True:
+                    m = json.loads(await ws.recv())
+                    c[m.get("type")] += 1
+                    if m.get("type") == "coach" and (m.get("payload") or m.get("data") or {}).get("phase") in ("Complete", "Failed", "Cancelled"):
+                        break
+        except (TimeoutError, Exception):
+            pass
+    print(json.dumps(c))
+asyncio.run(main())
+PY
+WSCPID=$!
+sleep 2
+OPTS='{"exposureSeconds":[1],"framesPerCombination":3,"driftSeconds":120,"trialSeconds":30,"repeatBaseline":false}'
+r=$(curl -s -X POST -H 'Content-Type: application/json' -d "$OPTS" $TNS/api/native-guider/coach/start); echo "$r" | jq -e '.success==true and .response.accepted==true' >/dev/null; res $? "coach start while guiding" "$(echo "$r" | jq -c '.response|{accepted,phase:.status.phase,steps:[.status.steps[]?.name]}')"
+SID=$(curl -s $TNS/api/native-guider/coach | jq -r .response.sessionId)
+code=$(curl -s -o $D/coach-busy.json -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d "$OPTS" $TNS/api/native-guider/coach/start)
+sid2=$(curl -s $TNS/api/native-guider/coach | jq -r .response.sessionId); ph=$(curl -s $TNS/api/native-guider/coach | jq -r .response.phase)
+[ "$code" = 409 ] && jq -e '.messageCode=="coach.busy"' $D/coach-busy.json >/dev/null && [ "$sid2" = "$SID" ] && [ "$ph" = Running ]; res $? "second start rejected, session untouched" "http $code $(jq -c '{messageCode}' $D/coach-busy.json) phase=$ph"
+r=$(curl -s $TNS/api/native-guider/status); echo "$r" | jq -e '.response.status.coachRunning == true' >/dev/null; res $? "status.coachRunning" "$(echo "$r" | jq -c '.response.status|{state,coachRunning}')"
+last=""; for i in $(seq 1 240); do
+  c=$(curl -s $TNS/api/native-guider/coach); ph=$(echo "$c" | jq -r .response.phase); st=$(echo "$c" | jq -r '.response.step // "-"')
+  cur="$ph/$st/$(echo "$c" | jq -r '[.response.steps[]? | select(.state=="Running") | .detailCode // ""] | first // ""')"
+  [ "$cur" != "$last" ] && echo "  coach $(date +%H:%M:%S) $cur" && last="$cur"
+  [ "$ph" != Running ] && break; sleep 5
+done
+echo "$c" > $D/coach-final.json
+[ "$ph" = Complete ]; res $? "coach session completes" "phase=$ph message=$(jq -r '.response.messageCode // ""' $D/coach-final.json) steps=$(jq -c '[.response.steps[]|{(.name):.state}]|add' $D/coach-final.json)"
+jq -e '.response.report as $r | ($r.grade|test("excellent|good|fair|poor|unknown")) and ($r.steps|length) >= 3 and ($r.findings|length) > 0' $D/coach-final.json >/dev/null; res $? "coach report card" "$(jq -c '.response.report|{grade,gradeRatio,guidedRmsArcsec,guidedSource,seeingArcsec,centroidNoiseArcsec,mountArcsec,actions:(.actions|length),findings:(.findings|length)}' $D/coach-final.json)"
+jq -e '.response.drift.seeingTotalArcsec > 0 and (.response.drift.samples|length) > 20' $D/coach-final.json >/dev/null; res $? "coach drift measured" "$(jq -c '.response.drift|{seeingTotalArcsec,raPeakToPeakArcsec,polarAlignmentErrorArcmin,decDriftArcsecPerMin,driftLimitingExposureSeconds,samples:(.samples|length)}' $D/coach-final.json)"
+jq -e '.response.response.backlashState != null and (.response.response.pulses|length) > 0' $D/coach-final.json >/dev/null; res $? "coach mount response" "$(jq -c '.response.response|{backlashState,backlashMs,minEffectivePulseRaMs,minEffectivePulseDecMs,asymmetryRa,asymmetryDec,rateRatioRa,rateRatioDec}' $D/coach-final.json)"
+jq -e '[.response.trials[] | select(.rmsTotalArcsec != null)] | length >= 2' $D/coach-final.json >/dev/null; res $? "coach trials" "$(jq -c '[.response.trials[]|{id,state,rms:.rmsTotalArcsec,winner:.isWinner}]' $D/coach-final.json)"
+jq -r '.response.report.findings[] | "    finding \(.severity) \(.code) \(.parameters|tostring|.[0:110])"' $D/coach-final.json | head -30
+for i in $(seq 1 24); do s=$(curl -s $TNS/api/native-guider/status | jq -r .response.status.state); [ "$s" = Guiding ] && break; sleep 5; done
+[ "$s" = Guiding ]; res $? "guiding resumed after the coach" "state=$s"
+r=$(curl -s "$TNS/api/native-guider/coach/history?max=5"); echo "$r" | jq -e '(.response|length) >= 1' >/dev/null; res $? "coach history" "$(echo "$r" | jq -c '[.response[]|{night,grade,profileName}]')"
+AID=$(jq -r '[.response.report.findings[] | select((.changes|length) > 0 and (.applied|not))][0].id // empty' $D/coach-final.json)
+if [ -n "$AID" ]; then
+  r=$(curl -s -X POST -H 'Content-Type: application/json' -d "{\"ids\":[\"$AID\"]}" $TNS/api/native-guider/coach/apply)
+  name=$(jq -r --arg id "$AID" '.response.report.findings[]|select(.id==$id)|.changes[0].name' $D/coach-final.json); want=$(jq -r --arg id "$AID" '.response.report.findings[]|select(.id==$id)|.changes[0].value' $D/coach-final.json)
+  now=$(curl -s $TNS/api/native-guider/settings | jq -r --arg n "$name" '.response.settings[]|select(.name==$n)|.value')
+  echo "$r" | jq -e '.success==true' >/dev/null && [ "$now" = "$want" ]; res $? "coach apply action" "$AID: $name $want (now $now)"
+else
+  res 0 "coach apply action" "no action with setting changes in this run"
+fi
+wait $WSCPID; grep -q '"coach"' $D/ws-coach.txt; res $? "coach websocket events" "$(cat $D/ws-coach.txt)"
+python3 $(dirname "$0")/shot.py $TNS $D Coach >/dev/null 2>&1; [ -s $D/ui-desktop-coach.png ]; res $? "Coach tab screenshots" "$D/ui-desktop-coach.png $D/ui-phone-coach.png"
 google-chrome --headless=new --no-sandbox --disable-gpu --hide-scrollbars --window-size=1366,1000 --virtual-time-budget=20000 --screenshot=$D/ui-desktop.png "$TNS/guider" >/dev/null 2>&1
 google-chrome --headless=new --no-sandbox --disable-gpu --hide-scrollbars --window-size=390,900 --virtual-time-budget=20000 --screenshot=$D/ui-phone.png "$TNS/guider" >/dev/null 2>&1
 [ -s $D/ui-desktop.png ]; res $? "UI screenshots" "$D/ui-desktop.png $D/ui-phone.png"

@@ -1,5 +1,9 @@
+# Usage: shot.py [ORIGIN] [OUT_DIR] [TAB]  - screenshots of the TNS guider page (desktop + phone), optionally after
+# clicking the guider page tab labelled TAB (e.g. Coach).
 import asyncio, base64, json, subprocess, sys, time, urllib.request, websockets
-ORIGIN = "http://172.18.0.4:5000"
+ORIGIN = sys.argv[1] if len(sys.argv) > 1 else "http://172.18.0.4:5000"
+OUT = sys.argv[2] if len(sys.argv) > 2 else "/home/andre/astro/sw/pins-wt/ng-test"
+TAB = sys.argv[3] if len(sys.argv) > 3 else ""
 def targets():
     return json.load(urllib.request.urlopen("http://127.0.0.1:9333/json"))
 async def main():
@@ -60,15 +64,23 @@ Object.keys(localStorage).join(',')
             for js in (close_js, confirm_js, whatsnew_js):
                 r = await cmd("Runtime.evaluate", expression=js, returnByValue=True)
                 print(r.get("result", {}).get("value")); await asyncio.sleep(1.5)
-            for name, w, h, mobile in [("desktop", 1366, 2300, False)]:
+            tab_js = """
+(() => { const b = [...document.querySelectorAll('button,[role=tab],a,div')].find(e => e.children.length === 0 && e.textContent.trim() === %s);
+  if (!b) return 'no tab'; (b.closest('button,[role=tab],a') || b).click(); return 'tab clicked'; })()
+""" % json.dumps(TAB)
+            for name, w, h, mobile in [("desktop", 1366, 2300, False), ("phone", 390, 1800, True)]:
                 await cmd("Emulation.setDeviceMetricsOverride", width=w, height=h, deviceScaleFactor=1, mobile=mobile)
                 r = await cmd("Runtime.evaluate", expression=nav_js, awaitPromise=True, returnByValue=True)
                 print(r.get("result", {}).get("value"))
                 await asyncio.sleep(10)
                 r = await cmd("Runtime.evaluate", expression=whatsnew_js, returnByValue=True)
                 await asyncio.sleep(1)
+                if TAB:
+                    r = await cmd("Runtime.evaluate", expression=tab_js, returnByValue=True)
+                    print(r.get("result", {}).get("value")); await asyncio.sleep(4)
                 shot = await cmd("Page.captureScreenshot", format="png")
-                open(f"/home/andre/astro/sw/pins-wt/ng-test/ui-{name}.png", "wb").write(base64.b64decode(shot["data"]))
+                suffix = f"-{TAB.lower()}" if TAB else ""
+                open(f"{OUT}/ui-{name}{suffix}.png", "wb").write(base64.b64decode(shot["data"]))
                 print("saved", name)
     finally:
         p.terminate()
