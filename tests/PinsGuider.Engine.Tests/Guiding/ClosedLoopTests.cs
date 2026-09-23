@@ -331,6 +331,40 @@ public class ClosedLoopTests
         step.Stars.Should().Contain(s => s.IsPrimary);
     }
 
+    [Test]
+    public async Task Writes_a_phd2_compatible_guide_log()
+    {
+        var h = new Harness(SimulatorScenario.GoodMount);
+        var sw = new StringWriter();
+        var log = new Engine.Logging.GuidingLog(sw, h.Clock);
+        log.EnableLogging();
+        using var bridge = new Engine.Logging.GuideLogBridge(h.Guider, log, h.Sim.Mount, () => new Engine.Logging.GuideLogContext
+        {
+            CameraName = "Simulator", MountName = "Simulated mount", SensorWidth = 1936, SensorHeight = 1216, PixelSizeUm = 5.86,
+        });
+        bool dithered = false;
+        h.OnEvent = e =>
+        {
+            if (e is SettleDoneEvent && !dithered)
+            {
+                dithered = true;
+                _ = h.Guider.DitherAsync(4, false, Settle);
+            }
+        };
+
+        _ = h.Guider.StartGuidingAsync(Settle);
+        await h.RunFor(TimeSpan.FromMinutes(6));
+        log.Close();
+
+        string text = sw.ToString();
+        text.Should().Contain("Calibration Begins at").And.Contain("Calibration complete").And.Contain("Guiding Begins at");
+        text.Should().Contain("Frame,Time,mount,dx,dy,RARawDistance,DECRawDistance,RAGuideDistance,DECGuideDistance");
+        text.Should().Contain("INFO: DITHER").And.Contain("INFO: SETTLING STATE CHANGE, Settling complete");
+        text.Should().Contain("Guiding Ends at");
+        int rows = text.Split('\n').Count(l => l.Length > 0 && char.IsDigit(l[0]) && l.Contains(",\"Mount\","));
+        rows.Should().BeGreaterThan(100);
+    }
+
     /// <summary>Wires a simulator, a guider and an event recorder together.</summary>
     private sealed class Harness
     {

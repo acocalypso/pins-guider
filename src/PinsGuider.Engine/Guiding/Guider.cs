@@ -132,6 +132,15 @@ public sealed class Guider : IAsyncDisposable
 
     public GuideErrorInfo? LastError => lastError;
 
+    /// <summary>Active RA guide algorithm (read-only use: parameters for logs/UI).</summary>
+    public IGuideAlgorithm RaAlgorithm => corrector.RaAlgorithm;
+
+    /// <summary>Active Dec guide algorithm (read-only use).</summary>
+    public IGuideAlgorithm DecAlgorithm => corrector.DecAlgorithm;
+
+    /// <summary>Search region in pixels actually used by star tracking.</summary>
+    public int SearchRegion => tracker.SearchRegion;
+
     /// <summary>Latest statistics snapshot (updated every guide frame).</summary>
     public GuidingStatsSnapshot? Statistics => lastStats;
 
