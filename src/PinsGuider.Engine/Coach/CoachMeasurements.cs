@@ -174,10 +174,79 @@ public sealed record TrialStatistics(int Frames, double RmsRaArcsec, double RmsD
     }
 }
 
+/// <summary>Noise-aware comparison of the trials (docs/COACH.md §2.4).</summary>
+/// <param name="Baseline">Trial A (current settings), or A2 when A did not complete; null without either.</param>
+/// <param name="Winner">
+/// The significantly better alternative (B or C) when there is one, else the baseline (the current settings are as good as
+/// the alternatives within the noise); null without a baseline.
+/// </param>
+/// <param name="Best">Lowest RMS of all completed trials.</param>
+/// <param name="Significant">True when <paramref name="Winner"/> is an alternative that beat the baseline by more than 2 standard errors.</param>
+/// <param name="ImprovementPercent">Improvement of the best alternative over the baseline (may be insignificant or negative).</param>
+/// <param name="ConditionsChangePercent">|A2 − A| / A in percent when both completed.</param>
+/// <param name="ConditionsChanged">The baseline changed by more than 25 % and by more than 2 standard errors.</param>
+public sealed record TrialVerdict(CoachTrial? Baseline, CoachTrial? Winner, CoachTrial? Best, bool Significant, double? ImprovementPercent,
+    double? ConditionsChangePercent, bool ConditionsChanged);
+
+/// <summary>Judges trials against the noise of their RMS values.</summary>
+public static class TrialJudge
+{
+    /// <summary>Relative change of the baseline (A vs A2) that counts as changed conditions.</summary>
+    public const double ConditionsChangeThreshold = 0.25;
+
+    /// <summary>Differences must exceed this many combined standard errors.</summary>
+    public const double SignificanceSigmas = 2.0;
+
+    /// <summary>Standard error of a trial's RMS: RMS/√(2N) for N frames.</summary>
+    public static double StandardError(CoachTrial t) => (t.RmsTotalArcsec ?? 0) / Math.Sqrt(2.0 * Math.Max(1, t.Frames));
+
+    /// <summary>Combined standard error of the difference of two trials' RMS values.</summary>
+    public static double CombinedStandardError(CoachTrial a, CoachTrial b) => Math.Sqrt(Sq(StandardError(a)) + Sq(StandardError(b)));
+
+    public static TrialVerdict Judge(IReadOnlyList<CoachTrial> trials)
+    {
+        var done = trials.Where(t => t.State == CoachTrialStates.Done && t.RmsTotalArcsec is > 0).ToList();
+        var a = done.FirstOrDefault(t => t.Id == CoachTrialIds.A);
+        var a2 = done.FirstOrDefault(t => t.Id == CoachTrialIds.A2);
+        var baseline = a ?? a2;
+        var best = done.OrderBy(t => t.RmsTotalArcsec).FirstOrDefault();
+
+        double? changePercent = null;
+        bool changed = false;
+        if (a is not null && a2 is not null)
+        {
+            double diff = Math.Abs(a2.RmsTotalArcsec!.Value - a.RmsTotalArcsec!.Value);
+            changePercent = diff / a.RmsTotalArcsec.Value * 100;
+            changed = diff > ConditionsChangeThreshold * a.RmsTotalArcsec.Value && diff > SignificanceSigmas * CombinedStandardError(a, a2);
+        }
+
+        if (baseline is null)
+        {
+            return new TrialVerdict(null, null, best, false, null, changePercent, changed);
+        }
+
+        var alternative = done.Where(t => t.Kind is not (CoachTrialKinds.Current or CoachTrialKinds.CurrentRepeat)).OrderBy(t => t.RmsTotalArcsec).FirstOrDefault();
+        if (alternative is null)
+        {
+            return new TrialVerdict(baseline, baseline, best, false, null, changePercent, changed);
+        }
+
+        double improvement = baseline.RmsTotalArcsec!.Value - alternative.RmsTotalArcsec!.Value;
+        bool significant = improvement > SignificanceSigmas * CombinedStandardError(baseline, alternative);
+        return new TrialVerdict(baseline, significant ? alternative : baseline, best, significant, improvement / baseline.RmsTotalArcsec.Value * 100,
+            changePercent, changed);
+    }
+
+    private static double Sq(double v) => v * v;
+}
+
 /// <summary>Outcome of a trial observation.</summary>
 internal sealed record TrialObservation(IReadOnlyList<TrialSample> Samples, double ElapsedSeconds, GuideErrorCode? Failure, bool StarLost, double PixelScale);
 
-/// <summary>Observes normal guiding for a trial (statistics and safety stay active).</summary>
+/// <summary>
+/// Observes normal guiding for a trial (statistics and safety stay active). Installed before settling so guiding failures
+/// then also end only the trial; samples are collected after <see cref="BeginMeasurement"/>.
+/// </summary>
 internal sealed class TrialObserver(double seconds, double lostTimeoutSec, Action<TrialObserver>? onProgress = null) : ICoachFrameHook
 {
     private readonly object gate = new();
@@ -188,10 +257,20 @@ internal sealed class TrialObserver(double seconds, double lostTimeoutSec, Actio
     private double elapsed;
     private double pixelScale = 1.0;
     private bool finished;
+    private bool measuring;
 
     public bool SuspendsGuiding => false;
 
     public Task<TrialObservation> Completion => tcs.Task;
+
+    /// <summary>Settling is over: collect samples from the next frame on.</summary>
+    public void BeginMeasurement()
+    {
+        lock (gate)
+        {
+            measuring = true;
+        }
+    }
 
     public double ElapsedSeconds
     {
@@ -239,7 +318,7 @@ internal sealed class TrialObserver(double seconds, double lostTimeoutSec, Actio
     {
         lock (gate)
         {
-            if (finished)
+            if (finished || !measuring)
             {
                 return [];
             }

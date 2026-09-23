@@ -161,7 +161,7 @@ public class CoachAnalysisTests
     [Test]
     public void Pulse_response_analysis_finds_min_pulse_asymmetry_and_rate()
     {
-        CoachPulse P(string dir, int ms, double ratio) => new() { Direction = dir, DurationMs = ms, Ratio = ratio };
+        CoachPulse P(string dir, int ms, double ratio) => new() { Direction = dir, DurationMs = ms, Ratio = ratio, ExpectedArcsec = ms / 100.0, MovedArcsec = ratio * ms / 100.0 };
         var pulses = new List<CoachPulse>
         {
             P("West", 100, 0.05), P("East", 100, 0.0), P("West", 250, 0.3), P("East", 250, 0.2),
@@ -173,6 +173,83 @@ public class CoachAnalysisTests
         MountResponseAnalyzer.Asymmetry(pulses, "West", "East", 500)!.Value.Should().BeApproximately(0.9 / 0.625, 1e-9);
         MountResponseAnalyzer.RateRatio(pulses, ra: false, 500)!.Value.Should().BeApproximately(1.0, 1e-9);
         MountResponseAnalyzer.MinEffectivePulse([P("East", 1000, 0.2)], true).Should().BeNull();
+        MountResponseAnalyzer.StictionPulse(pulses, ra: true, 0).Should().Be(500);
+        MountResponseAnalyzer.StictionPulse(pulses, ra: false, 0).Should().BeNull();
+
+        // with 0.5″ of measurement noise (mean of 4 moves: 0.25″) the 100 and 250 ms moves (1″, 2.5″ expected) are not
+        // conclusive enough at 100 ms: expected 1″ < 3 × 0.25″ is false (1 ≥ 0.75), so shrink the pulses to see the rule
+        var small = pulses.Select(p => p with { ExpectedArcsec = p.ExpectedArcsec / 4, MovedArcsec = p.MovedArcsec / 4 }).ToList();
+        var verdicts = MountResponseAnalyzer.Classify(small, ra: true, sigmaMoveArcsec: 0.5);
+        verdicts.Single(v => v.DurationMs == 100).Verdict.Should().Be(PulseVerdict.Inconclusive, "0.25″ expected is within 3σ = 0.75″");
+        verdicts.Single(v => v.DurationMs == 1000).Verdict.Should().Be(PulseVerdict.Effective);
+        MountResponseAnalyzer.StictionPulse(small, ra: true, sigmaMoveArcsec: 0.5).Should().BeNull("an inconclusive pulse is no evidence of stiction");
+    }
+
+    [Test]
+    public void Noisy_mount_without_stiction_gives_no_stiction()
+    {
+        foreach (var (noise, seed, seeing) in new[] { (0.25, 1, (double?)null), (0.25, 2, 0.25), (0.4, 3, null), (0.4, 4, 0.4), (0.6, 5, null) })
+        {
+            var mount = new KinematicDecMount(seed) { NoisePx = noise };
+            var result = Run(mount, new MountResponseProcedure(0, 0, lostTimeoutSec: 30, seeingRaPx: seeing, seeingDecPx: seeing));
+            TestContext.Out.WriteLine($"noise {noise} px seed {seed}: stiction RA {result.StictionRaMs} Dec {result.StictionDecMs}, " +
+                $"min pulse {result.Response.MinEffectivePulseRaMs}/{result.Response.MinEffectivePulseDecMs}, σ {result.SigmaRaArcsec:F3}″");
+            result.StictionRaMs.Should().BeNull();
+            result.StictionDecMs.Should().BeNull();
+            result.SigmaRaArcsec.Should().BeApproximately(noise * Math.Sqrt(2.0 / 3) * mount.PixelScale, 0.5 * noise * mount.PixelScale);
+        }
+    }
+
+    [Test]
+    public void Real_stiction_is_found_through_the_noise()
+    {
+        foreach (int seed in new[] { 1, 2, 3 })
+        {
+            var mount = new KinematicDecMount(seed) { RaStictionMs = 300, NoisePx = 0.25 };
+            var result = Run(mount, new MountResponseProcedure(0, 0, lostTimeoutSec: 30, seeingRaPx: 0.25, seeingDecPx: 0.25));
+            TestContext.Out.WriteLine($"seed {seed}: stiction RA {result.StictionRaMs} Dec {result.StictionDecMs}");
+            result.StictionRaMs.Should().Be(1000, "300 ms stiction leaves 500 ms pulses at 40 % of the expected move");
+            result.StictionDecMs.Should().BeNull();
+        }
+    }
+
+    [Test]
+    public void Defocus_needs_both_pixels_and_arcseconds()
+    {
+        CameraCheckAnalyzer.IsDefocused(2.2, 3.1).Should().BeFalse("an undersampled guide scope shows ~2 px ≈ 7″ in focus");
+        CameraCheckAnalyzer.IsDefocused(8, 0.5).Should().BeFalse("8 px at 0.5″/px is a normal 4″ star");
+        CameraCheckAnalyzer.IsDefocused(14, 0.5).Should().BeTrue();
+        CameraCheckAnalyzer.IsDefocused(5, 1.5).Should().BeTrue();
+        CameraCheckAnalyzer.IsDefocused(3.01, 1.51).Should().BeFalse("the smoke test's 3 px / 4.5″ stars are fine");
+    }
+
+    [Test]
+    public void Trial_winner_must_beat_the_baseline_by_two_standard_errors()
+    {
+        CoachTrial T(string id, string kind, double rms, int frames) => new() { Id = id, Kind = kind, State = CoachTrialStates.Done, RmsTotalArcsec = rms, Frames = frames };
+
+        // the smoke test: B 5.6 % better than A with ~100 frames each is within the noise
+        var smoke = TrialJudge.Judge([T("A", "current", 0.268, 100), T("B", "suggestion", 0.253, 100), T("C", "variant", 0.285, 100)]);
+        smoke.Significant.Should().BeFalse();
+        smoke.Winner!.Id.Should().Be("A", "the current settings are as good within the noise");
+        smoke.Best!.Id.Should().Be("B");
+        smoke.ImprovementPercent!.Value.Should().BeApproximately(5.6, 0.1);
+
+        var clear = TrialJudge.Judge([T("A", "current", 0.40, 100), T("B", "suggestion", 0.30, 100)]);
+        clear.Significant.Should().BeTrue();
+        clear.Winner!.Id.Should().Be("B");
+        TrialJudge.StandardError(T("A", "current", 0.4, 100)).Should().BeApproximately(0.4 / Math.Sqrt(200), 1e-12);
+
+        // A2 differs by 33 %: with 20 frames each that is noise, with 200 frames each it is a change of conditions
+        TrialJudge.Judge([T("A", "current", 0.30, 20), T("A2", "currentRepeat", 0.40, 20)]).ConditionsChanged.Should().BeFalse();
+        var changed = TrialJudge.Judge([T("A", "current", 0.30, 200), T("A2", "currentRepeat", 0.40, 200)]);
+        changed.ConditionsChanged.Should().BeTrue();
+        changed.ConditionsChangePercent!.Value.Should().BeApproximately(33.3, 0.1);
+        TrialJudge.Judge([T("A", "current", 0.30, 200), T("A2", "currentRepeat", 0.36, 200)]).ConditionsChanged.Should().BeFalse("20 % is below 25 %");
+
+        var noBaseline = TrialJudge.Judge([T("B", "suggestion", 0.3, 50)]);
+        noBaseline.Winner.Should().BeNull();
+        TrialJudge.Judge([T("A2", "currentRepeat", 0.4, 100), T("B", "suggestion", 0.3, 100)]).Baseline!.Id.Should().Be("A2");
     }
 
     [Test]
@@ -315,9 +392,9 @@ public class CoachAnalysisTests
     }
 
     /// <summary>Kinematic mount in mount-axis px: Dec backlash (dead band in pulse ms), RA stiction and East efficiency, Dec drift.</summary>
-    private sealed class KinematicDecMount
+    private sealed class KinematicDecMount(int seed = 11)
     {
-        private readonly Random rng = new(11);
+        private readonly Random rng = new(seed);
         private double play; // motor position inside the dead band, 0..BacklashMs
         private double lastT;
 

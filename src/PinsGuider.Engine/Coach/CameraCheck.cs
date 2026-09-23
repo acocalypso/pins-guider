@@ -84,6 +84,12 @@ public static class CameraCheckAnalyzer
         results.Where(r => r.Reason is not null).GroupBy(r => r.Reason!).OrderByDescending(g => g.Count()).ThenBy(g => g.Key, StringComparer.Ordinal)
             .Select(g => g.Key).FirstOrDefault() ?? ReasonNoStar;
 
+    /// <summary>
+    /// Defocus: HFD above 4 px and above 5″. Both are required: undersampled guide scopes (≥ 3″/px) show about 2 px ≈ 6″
+    /// even in perfect focus, and finely sampled ones (≤ 0.5″/px) show many pixels for a normal 3–4″ star.
+    /// </summary>
+    public static bool IsDefocused(double hfdPx, double pixelScale) => hfdPx > 4 && hfdPx * (pixelScale > 0 ? pixelScale : 1.0) > 5;
+
     /// <summary>Centroid noise estimate (arcsec, total of both axes) from HFD and SNR: √2·HFD/(2.355·SNR)·scale.</summary>
     public static double? CentroidNoiseArcsec(double? hfdPx, double? snr, double pixelScale) =>
         hfdPx is { } h && snr is { } s && s > 0 ? Math.Sqrt(2) * h / (2.355 * s) * (pixelScale > 0 ? pixelScale : 1.0) : null;

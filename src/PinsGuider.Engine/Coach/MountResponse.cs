@@ -5,11 +5,30 @@ using PinsGuider.Engine.Guiding;
 
 namespace PinsGuider.Engine.Coach;
 
-/// <summary>Evaluation of the pulse-response test (docs/COACH.md §2.3).</summary>
+/// <summary>Verdict for one tested pulse duration.</summary>
+public enum PulseVerdict
+{
+    /// <summary>The mean move reached at least 50 % of the expected move, and the expected move stands clear of the noise.</summary>
+    Effective,
+
+    /// <summary>The expected move is at least 3 σ of the measurement and the mean move stayed below 50 % of it.</summary>
+    Ineffective,
+
+    /// <summary>The expected move is too small compared with the measurement noise: no conclusion.</summary>
+    Inconclusive,
+}
+
+/// <summary>Pulse-response result of one duration on one axis (both directions, all repetitions).</summary>
+public sealed record PulseSizeResult(int DurationMs, int Count, double ExpectedArcsec, double MovedArcsec, double SigmaArcsec, PulseVerdict Verdict);
+
+/// <summary>Noise-aware evaluation of the pulse-response test (docs/COACH.md §2.3).</summary>
 public static class MountResponseAnalyzer
 {
     /// <summary>A pulse is effective when it moves at least this fraction of the expected distance.</summary>
     public const double EffectiveRatio = 0.5;
+
+    /// <summary>The expected move must be at least this many σ of the measurement for a verdict.</summary>
+    public const double ConclusiveSigmas = 3.0;
 
     /// <summary>Pulses at least this long are used for rate and asymmetry (short pulses are dominated by noise and stiction).</summary>
     public const int RateMinPulseMs = 500;
@@ -17,25 +36,63 @@ public static class MountResponseAnalyzer
     public static bool IsRa(string direction) => direction is "East" or "West";
 
     /// <summary>
-    /// Smallest pulse duration of the axis whose mean move reaches 50 % of the expected move, provided all longer tested
-    /// durations do too. Null when even the longest pulses fall short (or nothing was measured).
+    /// Verdict per pulse duration of an axis. <paramref name="sigmaMoveArcsec"/> is the σ of one measured move (before/after
+    /// averages); the σ of a duration's mean move is σ/√count. With σ = 0 every duration is conclusive.
     /// </summary>
-    public static int? MinEffectivePulse(IEnumerable<CoachPulse> pulses, bool ra)
+    public static IReadOnlyList<PulseSizeResult> Classify(IEnumerable<CoachPulse> pulses, bool ra, double sigmaMoveArcsec = 0)
     {
-        var bySize = pulses.Where(p => IsRa(p.Direction) == ra).GroupBy(p => p.DurationMs).OrderBy(g => g.Key)
-            .Select(g => (Ms: g.Key, Ratio: g.Average(p => p.Ratio))).ToList();
-        int? result = null;
-        for (int i = bySize.Count - 1; i >= 0; i--)
+        double sigma = double.IsFinite(sigmaMoveArcsec) ? Math.Max(0, sigmaMoveArcsec) : 0;
+        return pulses.Where(p => IsRa(p.Direction) == ra).GroupBy(p => p.DurationMs).OrderBy(g => g.Key).Select(g =>
         {
-            if (bySize[i].Ratio < EffectiveRatio)
+            int n = g.Count();
+            double expected = g.Average(p => p.ExpectedArcsec);
+            double moved = g.Average(p => p.MovedArcsec);
+            double sigmaMean = sigma / Math.Sqrt(n);
+            var verdict = expected < ConclusiveSigmas * sigmaMean || expected <= 0 ? PulseVerdict.Inconclusive
+                : moved < EffectiveRatio * expected ? PulseVerdict.Ineffective
+                : PulseVerdict.Effective;
+            return new PulseSizeResult(g.Key, n, expected, moved, sigmaMean, verdict);
+        }).ToList();
+    }
+
+    /// <summary>
+    /// Smallest pulse duration of the axis that is conclusively effective while no longer duration is ineffective; null when
+    /// no duration is conclusively effective.
+    /// </summary>
+    public static int? MinEffectivePulse(IEnumerable<CoachPulse> pulses, bool ra, double sigmaMoveArcsec = 0)
+    {
+        var sizes = Classify(pulses, ra, sigmaMoveArcsec);
+        int? result = null;
+        for (int i = sizes.Count - 1; i >= 0; i--)
+        {
+            if (sizes[i].Verdict == PulseVerdict.Ineffective)
             {
                 break;
             }
 
-            result = bySize[i].Ms;
+            if (sizes[i].Verdict == PulseVerdict.Effective)
+            {
+                result = sizes[i].DurationMs;
+            }
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Stiction: the minimum effective pulse when a shorter duration was conclusively ineffective; null otherwise (no
+    /// stiction, or the short pulses were inconclusive in the noise).
+    /// </summary>
+    public static int? StictionPulse(IEnumerable<CoachPulse> pulses, bool ra, double sigmaMoveArcsec)
+    {
+        var list = pulses.ToList();
+        int? min = MinEffectivePulse(list, ra, sigmaMoveArcsec);
+        if (min is not { } m)
+        {
+            return null;
+        }
+
+        return Classify(list, ra, sigmaMoveArcsec).Any(x => x.DurationMs < m && x.Verdict == PulseVerdict.Ineffective) ? m : null;
     }
 
     /// <summary>Ratio of the mean moves (moved/expected) of two directions for pulses ≥ <paramref name="minMs"/>; null when a direction is missing.</summary>
@@ -74,7 +131,11 @@ public static class MountResponseAnalyzer
 }
 
 /// <summary>Result of the mount response measurement.</summary>
-internal sealed record MountResponseResult(CoachResponse Response, bool StarLost, bool Truncated, double? BacklashPxPerMs);
+/// <param name="StictionRaMs">Minimum effective RA pulse when stiction was significant, else null (likewise Dec).</param>
+/// <param name="RaRatePxPerMs">Calibrated rates used for the expected moves (px/ms).</param>
+/// <param name="SigmaRaArcsec">σ of one measured RA move (before/after averages), arcsec (likewise Dec).</param>
+internal sealed record MountResponseResult(CoachResponse Response, bool StarLost, bool Truncated, double? BacklashPxPerMs, int? StictionRaMs,
+    int? StictionDecMs, double RaRatePxPerMs, double DecRatePxPerMs, double SigmaRaArcsec, double SigmaDecArcsec);
 
 /// <summary>
 /// Frame-driven mount response measurement (guiding output off): RA pulse response (W/E pairs), Dec backlash with an own
@@ -88,14 +149,19 @@ internal sealed record MountResponseResult(CoachResponse Response, bool StarLost
 /// the North rate) and y'₀ − y'ⱼ = r·(j·P − D) holds for j = k−1, k. The dead band is D = j·P − (y'₀ − y'ⱼ)/r, averaged
 /// over both points. Unlike PHD2's method (which compares against 90 % of the median North move and so underestimates by
 /// about 10 % of the travel) this is unbiased, also with asymmetric Dec rates.</para>
-/// <para>Each pulse is measured between the frame before and the frame after it, corrected for the linear drift measured
-/// in the Drift step. Pulses are capped at the max pulse durations and skipped when the star would get too close to the
-/// frame edge.</para>
+/// <para>Each response pulse is measured between the mean position of the 3 frames before and the 3 frames after it,
+/// corrected for the linear drift measured in the Drift step. The σ of a measured move comes from the drift step's seeing
+/// (else from the scatter within the averaging windows); short pulses whose expected move is within 3 σ are inconclusive
+/// and never reported as stiction. Pulses are capped at the max pulse durations and skipped when the star would get too
+/// close to the frame edge.</para>
 /// </remarks>
 internal sealed class MountResponseProcedure : ICoachFrameHook
 {
     private const int MaxClearingPulses = 15;
     private const int MaxRecenterSteps = 10;
+
+    /// <summary>Frames averaged before and after each response pulse.</summary>
+    public const int AverageFrames = 3;
     /// <summary>A backlash-test move counts as motion when it reaches this fraction of the calibrated move.</summary>
     private const double MoveRatio = 0.4;
 
@@ -109,6 +175,9 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
     private readonly double lostTimeoutSec;
     private readonly Action<MountResponseProcedure>? onProgress;
     private readonly Queue<Action> plan = new();
+    private readonly List<CoachFrame> sincePulse = [];
+    private readonly double? seeingRaPx;
+    private readonly double? seeingDecPx;
     private readonly List<CoachPulse> pulses = [];
     private readonly List<CoachPoint> backlashPoints = [];
     private readonly List<double> clearMoves = [];
@@ -141,10 +210,21 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
     private int clearCount;
     private int recenterSteps;
     private DateTimeOffset? southStartTime;
+    private bool waitRequested;
+    private DateTimeOffset? origin;
+    private double windowSsRa;
+    private double windowSsDec;
+    private int windowDof;
 
+    /// <param name="raDriftPxPerSec">Linear RA drift (mount px/s) removed from the measured moves; likewise Dec.</param>
+    /// <param name="seeingRaPx">Per-frame RA position noise (drift step seeing, px); null = estimate from the averaging windows.</param>
+    /// <param name="seeingDecPx">Per-frame Dec position noise, px; null = estimate.</param>
     public MountResponseProcedure(double raDriftPxPerSec, double decDriftPxPerSec, IReadOnlyList<int>? pulseSizes = null, int repetitions = 2,
-        bool measureBacklash = true, double lostTimeoutSec = 30, Action<MountResponseProcedure>? onProgress = null)
+        bool measureBacklash = true, double lostTimeoutSec = 30, Action<MountResponseProcedure>? onProgress = null, double? seeingRaPx = null,
+        double? seeingDecPx = null)
     {
+        this.seeingRaPx = seeingRaPx is > 0 ? seeingRaPx : null;
+        this.seeingDecPx = seeingDecPx is > 0 ? seeingDecPx : null;
         this.raDriftPxPerSec = double.IsFinite(raDriftPxPerSec) ? raDriftPxPerSec : 0;
         this.decDriftPxPerSec = double.IsFinite(decDriftPxPerSec) ? decDriftPxPerSec : 0;
         sizes = (pulseSizes ?? [100, 250, 500, 1000]).Where(s => s > 0).Distinct().Order().ToArray();
@@ -256,6 +336,7 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
         {
             lostSince ??= f.Time;
             pending = null;
+            sincePulse.Clear();
             if ((f.Time - lostSince.Value).TotalSeconds > lostTimeoutSec)
             {
                 starLost = true;
@@ -267,15 +348,23 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
 
         lostSince = null;
         frame = f;
+        origin ??= f.Time;
         if (estimatedSteps == 0)
         {
             BuildPlan(f);
         }
 
+        sincePulse.Add(f);
         if (pending is { } p)
         {
+            if (sincePulse.Count < p.FramesNeeded)
+            {
+                // still collecting the frames after the pulse
+                return [];
+            }
+
             pending = null;
-            p.Complete(f);
+            p.Complete(sincePulse.Skip(sincePulse.Count - p.FramesNeeded).ToList());
         }
 
         next = [];
@@ -287,7 +376,15 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
                 break;
             }
 
-            plan.Dequeue()();
+            var action = plan.Dequeue();
+            action();
+            if (waitRequested)
+            {
+                // the action needs more frames (averaging window): retry it on the next frame
+                waitRequested = false;
+                PrependFirst(action);
+                break;
+            }
         }
 
         return next;
@@ -338,7 +435,7 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
 
         plan.Enqueue(() => phase = "recenter");
         plan.Enqueue(RecenterStep);
-        estimatedSteps = raSizes.Length * repetitions * 2 + decSizes.Length * repetitions * 2 + (measureBacklash ? 8 : 2) + 3;
+        estimatedSteps = (raSizes.Length * repetitions * 2 + decSizes.Length * repetitions * 2) * AverageFrames + (measureBacklash ? 10 : 4) + 3;
     }
 
     private static int BacklashPulse(CoachFrame f)
@@ -370,32 +467,63 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
         return ok;
     }
 
-    private void Issue(GuideDirection dir, int ms, Action<CoachFrame, double, double>? complete)
+    /// <summary>Issues a pulse after the current frame; <paramref name="complete"/> gets the next <paramref name="framesAfter"/> frames.</summary>
+    private void Issue(GuideDirection dir, int ms, int framesAfter, Action<IReadOnlyList<CoachFrame>>? complete)
     {
-        var f = frame!;
-        var pos = f.MountPosition;
         next = [new PulseCommand(dir, ms)];
         issued++;
+        sincePulse.Clear();
         if (dir.Axis() == GuideAxis.Dec)
         {
             lastDecDirection = dir;
         }
 
-        if (complete is null)
+        pending = complete is null ? null : new Pending(Math.Max(1, framesAfter), complete);
+    }
+
+    /// <summary>Mean mount position and time (s since the start) of frames.</summary>
+    private (double X, double Y, double T) Mean(IReadOnlyList<CoachFrame> frames)
+    {
+        double x = 0, y = 0, t = 0;
+        foreach (var f in frames)
+        {
+            x += f.MountPosition.X;
+            y += f.MountPosition.Y;
+            t += (f.Time - origin!.Value).TotalSeconds;
+        }
+
+        return (x / frames.Count, y / frames.Count, t / frames.Count);
+    }
+
+    /// <summary>Move along the pulse direction between two positions, drift-corrected (px).</summary>
+    private double Move(GuideDirection dir, (double X, double Y, double T) before, (double X, double Y, double T) after)
+    {
+        bool ra = dir.Axis() == GuideAxis.Ra;
+        double delta = ra ? after.X - before.X : after.Y - before.Y;
+        double drift = (ra ? raDriftPxPerSec : decDriftPxPerSec) * (after.T - before.T);
+        double sign = dir is GuideDirection.East or GuideDirection.North ? 1 : -1;
+        return sign * (delta - drift);
+    }
+
+    private void AccumulateWindow(IReadOnlyList<CoachFrame> window)
+    {
+        if (window.Count < 2)
         {
             return;
         }
 
-        pending = new Pending(after =>
-        {
-            // move along the pulse direction, drift-corrected, px
-            bool ra = dir.Axis() == GuideAxis.Ra;
-            double delta = ra ? after.MountPosition.X - pos.X : after.MountPosition.Y - pos.Y;
-            double dt = (after.Time - f.Time).TotalSeconds;
-            double drift = (ra ? raDriftPxPerSec : decDriftPxPerSec) * dt;
-            double sign = dir is GuideDirection.East or GuideDirection.North ? 1 : -1;
-            complete(after, sign * (delta - drift), dt);
-        });
+        double mx = window.Average(f => f.MountPosition.X), my = window.Average(f => f.MountPosition.Y);
+        windowSsRa += window.Sum(f => (f.MountPosition.X - mx) * (f.MountPosition.X - mx));
+        windowSsDec += window.Sum(f => (f.MountPosition.Y - my) * (f.MountPosition.Y - my));
+        windowDof += window.Count - 1;
+    }
+
+    /// <summary>σ of one measured move (difference of two means of <see cref="AverageFrames"/> frames), px.</summary>
+    private double MoveSigmaPx(bool ra)
+    {
+        double? perFrame = ra ? seeingRaPx : seeingDecPx;
+        perFrame ??= windowDof > 0 ? Math.Sqrt((ra ? windowSsRa : windowSsDec) / windowDof) : null;
+        return (perFrame ?? 0) * Math.Sqrt(2.0 / AverageFrames);
     }
 
     private void ResponsePulse(GuideDirection dir, int ms)
@@ -405,12 +533,21 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
             return;
         }
 
+        if (sincePulse.Count < AverageFrames)
+        {
+            waitRequested = true;
+            return;
+        }
+
         var f = frame!;
         double rate = dir.Axis() == GuideAxis.Ra ? f.Transform.XRate : f.Transform.YRate;
         double scale = f.PixelScale > 0 ? f.PixelScale : 1.0;
+        var before = Mean(sincePulse.Skip(sincePulse.Count - AverageFrames).ToList());
         currentPulse = new PulseCommand(dir, ms);
-        Issue(dir, ms, (_, moved, _) =>
+        Issue(dir, ms, AverageFrames, afterFrames =>
         {
+            AccumulateWindow(afterFrames);
+            double moved = Move(dir, before, Mean(afterFrames));
             double expected = ms * rate;
             pulses.Add(new CoachPulse
             {
@@ -470,10 +607,12 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
 
         clearCount++;
         backlashCumulativeMs += backlashPulseMs;
-        Issue(GuideDirection.North, backlashPulseMs, (after, moved, _) =>
+        var before = Mean([f]);
+        Issue(GuideDirection.North, backlashPulseMs, 1, frames =>
         {
+            var after = frames[0];
             AddBacklashPoint(after);
-            clearMoves.Add(moved);
+            clearMoves.Add(Move(GuideDirection.North, before, Mean(frames)));
             int n = clearMoves.Count;
             double min = MoveRatio * backlashPulseMs * rate;
             if (n >= 2 && clearMoves[n - 1] >= min && clearMoves[n - 2] >= min && Consistent(clearMoves[n - 1], clearMoves[n - 2]))
@@ -508,11 +647,12 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
         }
 
         backlashCumulativeMs += backlashPulseMs;
-        var origin = southStartTime ??= f.Time;
-        Issue(GuideDirection.South, backlashPulseMs, (after, _, _) =>
+        var southOrigin = southStartTime ??= f.Time;
+        Issue(GuideDirection.South, backlashPulseMs, 1, frames =>
         {
+            var after = frames[0];
             AddBacklashPoint(after);
-            double t = (after.Time - origin).TotalSeconds;
+            double t = (after.Time - southOrigin).TotalSeconds;
             double y = after.MountPosition.Y - decDriftPxPerSec * t;
             southMoves.Add(southPositions[^1].Y - y);
             southPositions.Add((y, t));
@@ -557,7 +697,7 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
             return;
         }
 
-        Issue(dir, ms, null);
+        Issue(dir, ms, 0, null);
         if (backlashMs is { } dd && dd + pulse > f.MaxDecDurationMs)
         {
             // the take-up exceeds the max pulse: continue in further pulses
@@ -575,7 +715,7 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
             return;
         }
 
-        Issue(dir, ms, null);
+        Issue(dir, ms, 0, null);
         if (remainingMs > ms)
         {
             PrependFirst(() => EngageRemainder(dir, remainingMs - ms));
@@ -637,15 +777,19 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
 
         finished = true;
         pending = null;
-        tcs.TrySetResult(new MountResponseResult(BuildResponse(), starLost, truncated, northRate));
+        double scale = frame?.PixelScale is > 0 and var sc ? sc : 1.0;
+        double sigmaRa = MoveSigmaPx(true) * scale, sigmaDec = MoveSigmaPx(false) * scale;
+        tcs.TrySetResult(new MountResponseResult(BuildResponse(), starLost, truncated, northRate,
+            MountResponseAnalyzer.StictionPulse(pulses, true, sigmaRa), MountResponseAnalyzer.StictionPulse(pulses, false, sigmaDec),
+            frame?.Transform.XRate ?? 0, frame?.Transform.YRate ?? 0, sigmaRa, sigmaDec));
     }
 
     private CoachResponse BuildResponse()
     {
         double scale = frame?.PixelScale is > 0 and var s ? s : 1.0;
         double? rate = southRate ?? northRate ?? frame?.Transform.YRate;
-        int? minRa = MountResponseAnalyzer.MinEffectivePulse(pulses, ra: true);
-        int? minDec = MountResponseAnalyzer.MinEffectivePulse(pulses, ra: false);
+        int? minRa = MountResponseAnalyzer.MinEffectivePulse(pulses, ra: true, MoveSigmaPx(true) * scale);
+        int? minDec = MountResponseAnalyzer.MinEffectivePulse(pulses, ra: false, MoveSigmaPx(false) * scale);
         int raBasis = MountResponseAnalyzer.RateBasis(pulses, true, minRa);
         int decBasis = MountResponseAnalyzer.RateBasis(pulses, false, minDec);
         return new CoachResponse
@@ -668,8 +812,10 @@ internal sealed class MountResponseProcedure : ICoachFrameHook
 
     private static double? Round(double? v) => v is { } d ? Math.Round(d, 3) : null;
 
-    private sealed class Pending(Action<CoachFrame> complete)
+    private sealed class Pending(int framesNeeded, Action<IReadOnlyList<CoachFrame>> complete)
     {
-        public void Complete(CoachFrame after) => complete(after);
+        public int FramesNeeded { get; } = framesNeeded;
+
+        public void Complete(IReadOnlyList<CoachFrame> after) => complete(after);
     }
 }

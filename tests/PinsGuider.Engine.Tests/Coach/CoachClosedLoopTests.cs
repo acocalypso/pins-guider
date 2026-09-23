@@ -49,9 +49,10 @@ public class CoachClosedLoopTests
         d.PolarAlignmentErrorArcmin!.Value.Should().BeApproximately(3.8197 * 2 / cosDec, 0.15 * 3.8197 * 2 / cosDec);
         d.DeclinationAssumed.Should().BeFalse();
 
-        // seeing: 0.4″ per axis for 1 s, averaging as 1/√T over the 2 s exposure, both axes
-        double seeingTruth = Math.Sqrt(2) * 0.4 / Math.Sqrt(2.0);
-        d.SeeingTotalArcsec!.Value.Should().BeApproximately(seeingTruth, 0.3 * seeingTruth);
+        // seeing: 0.4″ per axis for 1 s, averaging as 1/√T over the 2 s exposure, both axes: 0.4″ for a single star; the
+        // multi-star position averages the half of the variance that is not common to all stars (SeeingCommonFraction 0.5)
+        double singleStar = Math.Sqrt(2) * 0.4 / Math.Sqrt(2.0);
+        d.SeeingTotalArcsec!.Value.Should().BeInRange(0.85 * Math.Sqrt(0.5) * singleStar, 1.1 * singleStar);
         d.Samples.Should().HaveCountGreaterThan(100);
 
         // the PE model of the contract reproduces the published samples
@@ -75,7 +76,7 @@ public class CoachClosedLoopTests
         {
             DecBacklashArcsec = 12.0,
             RaStictionMs = 200,
-            DecSouthEfficiency = 0.7,
+            DecSouthEfficiency = 0.6,
             DecDriftArcsecPerMin = 0.3,
             RandomWalkArcsecPerSqrtSec = 0.01,
         };
@@ -84,8 +85,8 @@ public class CoachClosedLoopTests
 
         status.Phase.Should().Be(CoachPhases.Complete, status.Message);
         var r = status.Response!;
-        // the dead band takes 1/0.7 longer with the slower South motor; its angle is the configured 12″
-        double truthMs = mount.DecBacklashMs / 0.7;
+        // the dead band takes 1/0.6 longer with the slower South motor; its angle is the configured 12″
+        double truthMs = mount.DecBacklashMs / 0.6;
         TestContext.Out.WriteLine($"backlash {r.BacklashMs} ms / {r.BacklashArcsec}″ ({r.BacklashState}), truth {truthMs:F0} ms / 12″; " +
             $"min pulse RA {r.MinEffectivePulseRaMs} Dec {r.MinEffectivePulseDecMs}; asym RA {r.AsymmetryRa} Dec {r.AsymmetryDec}; rate RA {r.RateRatioRa} Dec {r.RateRatioDec}");
         foreach (var p in r.Pulses)
@@ -99,7 +100,7 @@ public class CoachClosedLoopTests
         r.BacklashPoints.Should().HaveCountGreaterThan(4);
         r.MinEffectivePulseRaMs.Should().Be(500, "200 ms of stiction: 250 ms pulses move less than half");
         r.MinEffectivePulseDecMs.Should().Be(100);
-        r.AsymmetryDec!.Value.Should().BeApproximately(1 / 0.7, 0.2);
+        r.AsymmetryDec!.Value.Should().BeApproximately(1 / 0.6, 0.2);
         r.AsymmetryRa!.Value.Should().BeApproximately(1.0, 0.15);
         r.RateRatioRa!.Value.Should().BeGreaterThan(1.1, "stiction made the calibration underestimate the RA rate");
 
@@ -155,6 +156,8 @@ public class CoachClosedLoopTests
         status.Trials.Where(t => t.State == CoachTrialStates.Done).Should().HaveCountGreaterThanOrEqualTo(3);
         status.Trials.Should().ContainSingle(t => t.IsWinner);
         status.Findings.Should().Contain(f => f.Code == CoachCodes.TrialsWinner || f.Code == CoachCodes.TrialsNoImprovement);
+        status.Findings.Should().NotContain(f => f.Code == CoachCodes.ResponseMinPulse, "the good mount has no stiction");
+        status.Findings.Should().NotContain(f => f.Code == CoachCodes.CameraDefocused, "3 px / 4.5″ stars are in focus");
         foreach (var t in status.Trials)
         {
             TestContext.Out.WriteLine($"trial {t.Id} {t.State}: {t.RmsTotalArcsec}″ osc {t.OscillationIndex} frames {t.Frames} " +
@@ -166,7 +169,8 @@ public class CoachClosedLoopTests
         report.Grade.Should().NotBe(CoachGrades.Unknown);
         report.Steps.Should().Equal(CoachStepNames.All);
         report.ProfileName.Should().Be("Test");
-        report.Actions.Should().OnlyContain(id => report.Findings.Any(f => f.Id == id && (f.Severity == CoachSeverities.Warning || f.Severity == CoachSeverities.Problem)));
+        report.Actions.All(id => report.Findings.Any(f => f.Id == id && (f.Severity == CoachSeverities.Warning || f.Severity == CoachSeverities.Problem)))
+            .Should().BeTrue("actions are the warning/problem findings");
         TestContext.Out.WriteLine($"grade {report.Grade} ({report.GradeRatio}), guided {report.GuidedRmsArcsec}″ = seeing {report.SeeingArcsec} + noise {report.CentroidNoiseArcsec} + mount {report.MountArcsec}");
         foreach (var f in report.Findings)
         {
@@ -391,6 +395,12 @@ public class CoachClosedLoopTests
             TestContext.Out.WriteLine($"trial {t.Id} {t.State} {t.RmsTotalArcsec}″ frames {t.Frames}");
         }
 
+        TestContext.Out.WriteLine($"phase {status.Phase} {status.MessageCode} {string.Join(",", status.MessageParameters.Select(kv => kv.Key + "=" + kv.Value))}");
+        foreach (var e in h.Events.Where(e => e is AlertEvent or AppStateEvent or CoachStatusEvent { Status.Phase: not "Running" } or StartGuidingEvent or GuidingStoppedEvent))
+        {
+            TestContext.Out.WriteLine($"  {h.Seconds(e.Timestamp):F1}s {e switch { AlertEvent a => "alert " + a.Code, AppStateEvent st => $"state {st.Previous}->{st.State}", CoachStatusEvent c => "coach " + c.Status.Phase, _ => e.Phd2Name }}");
+        }
+
         status.Phase.Should().Be(CoachPhases.Complete);
         status.Trials.Single(t => t.Id == CoachTrialIds.A).State.Should().Be(CoachTrialStates.Failed);
         status.Trials.Single(t => t.Id == CoachTrialIds.A2).State.Should().Be(CoachTrialStates.Done);
@@ -425,6 +435,58 @@ public class CoachClosedLoopTests
         dec[0].Changes.Should().ContainSingle(c => c.Name == CoachSettingNames.DecGuideMode);
         h.Guider.DismissHint(dec[0].Id).Should().BeTrue();
         h.Guider.ActiveHints.Should().NotContain(x => x.Id == dec[0].Id);
+    }
+
+    [Test]
+    public async Task Good_mount_with_short_exposures_shows_no_false_stiction_or_defocus()
+    {
+        // the full-image smoke test setup: GoodMount, 1 s exposures, 1.51″/px
+        var h = new Harness(SimulatorScenario.GoodMount, s => s with { ExposureMs = 1000 });
+        var status = await h.RunFromGuiding(new CoachOptions
+        {
+            Steps = [CoachStepNames.CameraCheck, CoachStepNames.Drift, CoachStepNames.MountResponse],
+            ExposureSeconds = [1],
+            Gains = [0],
+            FramesPerCombination = 3,
+            DriftSeconds = 120,
+        });
+
+        status.Phase.Should().Be(CoachPhases.Complete, status.Message);
+        var r = status.Response!;
+        TestContext.Out.WriteLine($"min pulse RA {r.MinEffectivePulseRaMs} Dec {r.MinEffectivePulseDecMs}");
+        foreach (var p in r.Pulses)
+        {
+            TestContext.Out.WriteLine($"  {p.Direction} {p.DurationMs} ms: {p.MovedArcsec}″ / {p.ExpectedArcsec}″");
+        }
+
+        status.Findings.Should().NotContain(f => f.Code == CoachCodes.ResponseMinPulse);
+        status.Findings.Should().NotContain(f => f.Code == CoachCodes.CameraDefocused);
+        r.Pulses.Should().HaveCount(32);
+        h.AssertRestoredAndGuiding();
+    }
+
+    [Test]
+    public async Task Seeing_matches_the_guided_rms_floor_with_multi_star()
+    {
+        // a perfect mount: whatever guiding cannot remove is seeing, measured on the same multi-star offset
+        var h = new Harness(Quiet(new MountSimConfig(), seeing: 0.8));
+        var status = await h.RunFromGuiding(new CoachOptions
+        {
+            Steps = [CoachStepNames.Drift, CoachStepNames.Trials],
+            DriftSeconds = 150,
+            TrialSeconds = 120,
+            RepeatBaseline = false,
+        });
+
+        status.Phase.Should().Be(CoachPhases.Complete, status.Message);
+        double seeing = status.Drift!.SeeingTotalArcsec!.Value;
+        var a = status.Trials.Single(t => t.Id == CoachTrialIds.A);
+        var report = status.Report!;
+        TestContext.Out.WriteLine($"seeing {seeing}″, trial A {a.RmsTotalArcsec}″ ({a.Frames} frames), budget: seeing {report.SeeingArcsec} + noise " +
+            $"{report.CentroidNoiseArcsec} + mount {report.MountArcsec} = {report.GuidedRmsArcsec}");
+        (a.RmsTotalArcsec!.Value / seeing).Should().BeInRange(0.8, 1.4, "the guided RMS floor is the (multi-star) seeing");
+        report.MountArcsec!.Value.Should().BeLessThan(0.7 * report.GuidedRmsArcsec!.Value, "the budget adds up without a large mount term");
+        h.AssertRestoredAndGuiding();
     }
 
     /// <summary>Wires simulator, guider, coach and an event recorder; runs sessions in virtual time.</summary>

@@ -914,7 +914,7 @@ public sealed class GuidingCoach
                         new() { ["snr"] = snr, ["noiseArcsec"] = noise is { } n ? Math.Round(n, 3) : null }, noise * 0.5));
                 }
 
-                if (rec.Hfd is { } hfd && (hfd > 5 || hfd * scale > 3))
+                if (rec.Hfd is { } hfd && CameraCheckAnalyzer.IsDefocused(hfd, scale))
                 {
                     AddFinding(CoachFindings.Create(CoachCodes.CameraDefocused, CoachStepNames.CameraCheck, CoachSeverities.Warning, ts,
                         new() { ["hfdPx"] = Math.Round(hfd, 2), ["hfdArcsec"] = Math.Round(hfd * scale, 2) },
@@ -1088,7 +1088,8 @@ public sealed class GuidingCoach
                 a = driftAnalysis;
             }
 
-            var hook = new MountResponseProcedure(a?.RaDriftPxPerSec ?? 0, a?.DecDriftPxPerSec ?? 0, lostTimeoutSec: LostTimeoutSec, onProgress: h =>
+            var hook = new MountResponseProcedure(a?.RaDriftPxPerSec ?? 0, a?.DecDriftPxPerSec ?? 0, lostTimeoutSec: LostTimeoutSec,
+                seeingRaPx: a?.SeeingRaPx, seeingDecPx: a?.SeeingDecPx, onProgress: h =>
             {
                 lock (gate)
                 {
@@ -1124,16 +1125,24 @@ public sealed class GuidingCoach
                 throw new StepFailedException(CoachCodes.StarLost);
             }
 
-            ResponseFindings(result.Response);
+            ResponseFindings(result);
             DecGuideModeFinding();
         }
 
-        private void ResponseFindings(CoachResponse r)
+        private void ResponseFindings(MountResponseResult result)
         {
+            var r = result.Response;
             var ts = Now();
             bool warnings = false;
-            var t = guider.Calibration;
             double scale = guider.PixelScale;
+            DriftAnalysis? a;
+            lock (gate)
+            {
+                a = driftAnalysis;
+            }
+
+            var s = guider.BaseSettings;
+            double smart = MinMove.SmartDefault(s.FocalLengthMm, s.PixelSizeUm > 0 ? s.PixelSizeUm : guider.Camera.PixelSizeUm, s.Binning);
             if (r.BacklashState == CoachBacklashStates.Measured && r.BacklashMs is { } ms)
             {
                 string severity = ms < 100 ? CoachSeverities.Good : ms < 1000 ? CoachSeverities.Info : CoachSeverities.Warning;
@@ -1154,24 +1163,27 @@ public sealed class GuidingCoach
                     new() { ["ms"] = r.BacklashMs ?? 0, ["arcsec"] = r.BacklashArcsec ?? 0 }));
             }
 
-            int smallestRa = r.Pulses.Where(p => MountResponseAnalyzer.IsRa(p.Direction)).Select(p => p.DurationMs).DefaultIfEmpty(0).Min();
-            int smallestDec = r.Pulses.Where(p => !MountResponseAnalyzer.IsRa(p.Direction)).Select(p => p.DurationMs).DefaultIfEmpty(0).Min();
-            foreach (var (axis, minPulse, smallest, rate) in new[]
+            // stiction only when short pulses were conclusively ineffective (expected move ≥ 3 σ of the measurement)
+            foreach (var (axis, stiction, rate, seeingMinMove) in new[]
             {
-                ("Ra", r.MinEffectivePulseRaMs, smallestRa, t?.XRate ?? 0),
-                ("Dec", r.MinEffectivePulseDecMs, smallestDec, t?.YRate ?? 0),
+                ("Ra", result.StictionRaMs, result.RaRatePxPerMs, a?.MinMoveRaPx ?? smart),
+                ("Dec", result.StictionDecMs, result.DecRatePxPerMs, a?.MinMoveDecPx ?? smart),
             })
             {
-                if (minPulse is { } mp && mp > smallest && smallest > 0)
+                if (stiction is not { } mp)
                 {
-                    double minMove = Math.Round(Math.Ceiling(mp * rate / 0.05 - 1e-9) * 0.05, 2);
-                    var changes = minMove > 0
-                        ? new[] { Change(axis == "Ra" ? CoachSettingNames.RaMinMove : CoachSettingNames.DecMinMove, CoachSettingsMap.Format(minMove)) }
-                        : [];
-                    AddFinding(CoachFindings.Create(CoachCodes.ResponseMinPulse, CoachStepNames.MountResponse, CoachSeverities.Warning, ts,
-                        new() { ["axis"] = axis, ["ms"] = mp }, minMove * scale * 0.2, changes, qualifier: axis));
-                    warnings = true;
+                    continue;
                 }
+
+                // min-move so that corrections reach the effective pulse at the calibrated rate, but never far above the seeing
+                double cap = Math.Max(2 * seeingMinMove, 0.6);
+                double minMove = Math.Round(Math.Min(Math.Ceiling(mp * rate / 0.05 - 1e-9) * 0.05, cap), 2);
+                var changes = minMove > 0
+                    ? new[] { Change(axis == "Ra" ? CoachSettingNames.RaMinMove : CoachSettingNames.DecMinMove, CoachSettingsMap.Format(minMove)) }
+                    : [];
+                AddFinding(CoachFindings.Create(CoachCodes.ResponseMinPulse, CoachStepNames.MountResponse, CoachSeverities.Warning, ts,
+                    new() { ["axis"] = axis, ["ms"] = mp }, minMove * scale * 0.2, changes, qualifier: axis));
+                warnings = true;
             }
 
             foreach (var (axis, ratio) in new[] { ("Ra", r.AsymmetryRa), ("Dec", r.AsymmetryDec) })
@@ -1298,15 +1310,8 @@ public sealed class GuidingCoach
             SetDetail("trial " + trial.Id + " settling", CoachDetailCodes.TrialSettling, new() { ["id"] = trial.Id });
             await ApplyOverlayAsync(trial.Settings.Count == 0 ? null : trial.Settings).ConfigureAwait(false);
             await EnsureGuidingAsync(ct).ConfigureAwait(false);
-            var settle = await guider.StartGuidingForCoachAsync(TrialSettle(), ct, coach.LoopToken).ConfigureAwait(false);
-            ct.ThrowIfCancellationRequested();
-            if (!guider.State.IsGuidingActive())
-            {
-                throw new StepFailedException(settle.Code == GuideErrorCode.None ? CoachCodes.Internal : CoachCodes.StarLost, settle.Error);
-            }
 
-            UpdateTrial(index, t => t with { State = CoachTrialStates.Running });
-            SetDetail("trial " + trial.Id + " guiding", CoachDetailCodes.TrialRunning, new() { ["id"] = trial.Id });
+            // the observer is installed before settling so a runaway while settling also fails only this trial
             var observer = new TrialObserver(options.TrialSeconds, LostTimeoutSec, h =>
             {
                 var stats = h.CurrentStatistics();
@@ -1324,6 +1329,23 @@ public sealed class GuidingCoach
             }
 
             await OnLoopAsync(guider.SetCoachHookAsync(observer)).ConfigureAwait(false);
+            var settleTask = guider.StartGuidingForCoachAsync(TrialSettle(), ct, coach.LoopToken);
+            await Task.WhenAny(settleTask, observer.Completion).ConfigureAwait(false);
+            ct.ThrowIfCancellationRequested();
+            if (!observer.Completion.IsCompleted)
+            {
+                var settle = await settleTask.ConfigureAwait(false);
+                if (!guider.State.IsGuidingActive())
+                {
+                    await OnLoopAsync(guider.SetCoachHookAsync(null)).ConfigureAwait(false);
+                    throw new StepFailedException(settle.Code == GuideErrorCode.None ? CoachCodes.Internal : CoachCodes.StarLost, settle.Error);
+                }
+
+                UpdateTrial(index, t => t with { State = CoachTrialStates.Running });
+                SetDetail("trial " + trial.Id + " guiding", CoachDetailCodes.TrialRunning, new() { ["id"] = trial.Id });
+                observer.BeginMeasurement();
+            }
+
             var obs = await WaitHookAsync(observer.Completion, observer.Stop, ct, sessionCt).ConfigureAwait(false);
             await OnLoopAsync(guider.SetCoachHookAsync(null)).ConfigureAwait(false);
             var final = TrialStatistics.Compute(obs.Samples, obs.PixelScale);
@@ -1572,28 +1594,20 @@ public sealed class GuidingCoach
                 list = trials.ToList();
             }
 
-            var done = list.Where(t => t.State == CoachTrialStates.Done && t.RmsTotalArcsec is not null).ToList();
-            if (done.Count == 0)
+            var verdict = TrialJudge.Judge(list);
+            if (verdict.Baseline is not { } baseline)
             {
                 return;
             }
 
             var ts = Now();
-            var a = done.FirstOrDefault(t => t.Id == CoachTrialIds.A);
-            var a2 = done.FirstOrDefault(t => t.Id == CoachTrialIds.A2);
-            if (a is not null && a2 is not null && a.RmsTotalArcsec > 0)
+            if (verdict.ConditionsChanged)
             {
-                double change = Math.Abs(a2.RmsTotalArcsec!.Value - a.RmsTotalArcsec!.Value) / a.RmsTotalArcsec.Value * 100;
-                if (change > 25)
-                {
-                    AddFinding(CoachFindings.Create(CoachCodes.TrialsConditionsChanged, CoachStepNames.Trials, CoachSeverities.Warning, ts,
-                        new() { ["changePercent"] = Math.Round(change, 1) }));
-                }
+                AddFinding(CoachFindings.Create(CoachCodes.TrialsConditionsChanged, CoachStepNames.Trials, CoachSeverities.Warning, ts,
+                    new() { ["changePercent"] = Math.Round(verdict.ConditionsChangePercent ?? 0, 1) }));
             }
 
-            var winner = done.OrderBy(t => t.RmsTotalArcsec).First();
-            var baselines = new[] { a, a2 }.Where(t => t is not null).Select(t => t!.RmsTotalArcsec!.Value).ToList();
-            double? baseline = baselines.Count > 0 ? baselines.Average() : null;
+            var winner = verdict.Winner!;
             lock (gate)
             {
                 for (int i = 0; i < trials.Count; i++)
@@ -1602,23 +1616,24 @@ public sealed class GuidingCoach
                 }
             }
 
-            if (winner.Kind is CoachTrialKinds.Current or CoachTrialKinds.CurrentRepeat)
+            if (!verdict.Significant)
             {
+                // within the noise the current settings are as good as the alternatives (B/C stay applicable as trials)
                 AddFinding(CoachFindings.Create(CoachCodes.TrialsNoImprovement, CoachStepNames.Trials, CoachSeverities.Good, ts,
-                    new() { ["rmsArcsec"] = winner.RmsTotalArcsec }));
+                    new() { ["rmsArcsec"] = baseline.RmsTotalArcsec }));
             }
             else
             {
-                double? improvement = baseline is { } bl && bl > 0 ? (bl - winner.RmsTotalArcsec!.Value) / bl * 100 : null;
+                double improvement = verdict.ImprovementPercent ?? 0;
                 AddFinding(CoachFindings.Create(CoachCodes.TrialsWinner, CoachStepNames.Trials,
                     improvement >= 10 ? CoachSeverities.Good : CoachSeverities.Info, ts,
                     new()
                     {
                         ["id"] = winner.Id,
                         ["rmsArcsec"] = winner.RmsTotalArcsec,
-                        ["baselineRmsArcsec"] = baseline is { } b ? Math.Round(b, 3) : null,
-                        ["improvementPercent"] = improvement is { } imp ? Math.Round(imp, 1) : null,
-                    }, baseline - winner.RmsTotalArcsec, winner.Settings));
+                        ["baselineRmsArcsec"] = baseline.RmsTotalArcsec,
+                        ["improvementPercent"] = Math.Round(improvement, 1),
+                    }, baseline.RmsTotalArcsec - winner.RmsTotalArcsec, winner.Settings));
             }
 
             Publish();
@@ -1966,7 +1981,7 @@ public sealed class GuidingCoach
                 CoachStepNames.CameraCheck => (options.ExposureSeconds.Count > 0 ? options.ExposureSeconds.Sum() : 6.0) * 3 * options.FramesPerCombination
                     + 3 * 3 * options.FramesPerCombination * 0.5,
                 CoachStepNames.Drift => options.DriftSeconds + 15,
-                CoachStepNames.MountResponse => 44 * (exposure + 1.0),
+                CoachStepNames.MountResponse => (32 * MountResponseProcedure.AverageFrames + 20) * (exposure + 0.7),
                 CoachStepNames.Trials => (options.RepeatBaseline ? 4 : 3) * (options.TrialSeconds + 20),
                 _ => 0,
             };
