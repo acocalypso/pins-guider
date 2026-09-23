@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    NINA/PINS plugin hosting the native guider. Builds only inside a pins checkout
+    (pins/NINA.Plugins/pins-guider), because it references the pins core projects.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Library</OutputType>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <RootNamespace>PinsGuider.Plugin</RootNamespace>
+    <AssemblyName>PinsGuider.Plugin</AssemblyName>
+    <!-- pins core is not warning-clean; keep plugin warnings visible but non-fatal -->
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <Nullable>enable</Nullable>
+    <NoWarn>$(NoWarn);CS8632;CA1416</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <Page Remove="**\*.xaml" />
+    <ProjectReference Include="..\PinsGuider.Engine\PinsGuider.Engine.csproj" />
+    <ProjectReference Include="..\..\..\..\NINA.Astrometry\NINA.Astrometry.csproj" />
+    <ProjectReference Include="..\..\..\..\NINA.Core\NINA.Core.csproj" />
+    <ProjectReference Include="..\..\..\..\NINA.Equipment\NINA.Equipment.csproj" />
+    <ProjectReference Include="..\..\..\..\NINA.Image\NINA.Image.csproj" />
+    <ProjectReference Include="..\..\..\..\NINA.Plugin\NINA.Plugin.csproj" />
+    <ProjectReference Include="..\..\..\..\NINA.Profile\NINA.Profile.csproj" />
+    <ProjectReference Include="..\..\..\..\NINA.Sequencer\NINA.Sequencer.csproj" />
+    <ProjectReference Include="..\..\..\..\NINA.WPF.Base\NINA.WPF.Base.csproj" />
+    <ProjectReference Include="..\..\..\..\System.Windows.Compat\System.Windows.Compat.csproj" />
+    <!-- Exclude System.Drawing.Common as it conflicts with the compat library -->
+    <PackageReference Include="System.Drawing.Common" Version="*" ExcludeAssets="all" />
+  </ItemGroup>
+</Project>
