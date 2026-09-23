@@ -63,6 +63,8 @@ internal sealed class NativeGuiderOptions
         new("PixelSizeUm", "Pixel size override", "Camera", "double", "0", Unit: "µm", Min: 0, Max: 50, Description: "0 uses the camera driver's pixel size."),
         new("NoiseReduction", "Noise reduction", "Camera", "enum", "None", Options: ["None", "Mean2x2", "Median3x3"],
             Phd2Fallback: s => s.PHD2NoiseReductionMethod switch { 1 => "Mean2x2", 2 => "Median3x3", 0 => "None", _ => null }),
+        new("UseDarkLibrary", "Use dark library", "Camera", "bool", "true", Basic: true,
+            Description: "Subtract darks: the native library if built, otherwise PHD2's dark library for this camera size."),
         new("PulseOutput", "Guide output", "Camera", "enum", "Mount", Basic: true, Options: ["Mount", "CameraST4"], RequiresReconnect: true,
             Description: "Mount: pulse guiding through the connected mount driver. CameraST4: through the guide camera's ST4 port."),
 
@@ -294,6 +296,8 @@ internal sealed class NativeGuiderOptions
     public bool UseCameraSt4 => GetString("PulseOutput") == "CameraST4";
 
     public bool SaveGuideLog => GetBool("SaveGuideLog");
+
+    public bool UseDarkLibrary => GetBool("UseDarkLibrary");
 
     public bool ReuseCalibration => GetBool("ReuseCalibration");
 

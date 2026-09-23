@@ -108,6 +108,43 @@ public class FitsReaderTests
     }
 
     [Test]
+    public void Multi_hdu_roundtrip_keeps_frames_and_keywords()
+    {
+        var a = new GuideFrame(5, 4);
+        var b = new GuideFrame(5, 4);
+        for (int i = 0; i < 20; i++)
+        {
+            a.Pixels[i] = (ushort)(i * 100);
+            b.Pixels[i] = (ushort)(65535 - i);
+        }
+
+        using var ms = new MemoryStream();
+        FitsReader.Write(ms, [(a, new Dictionary<string, string> { ["EXPOSURE"] = "0.5" }), (b, new Dictionary<string, string> { ["EXPOSURE"] = "2" })]);
+        var hdus = FitsReader.ReadAll(ms.ToArray());
+        hdus.Should().HaveCount(2);
+        hdus[0].Frame.Pixels.Should().Equal(a.Pixels);
+        hdus[1].Frame.Pixels.Should().Equal(b.Pixels);
+        hdus[1].Header["EXPOSURE"].Should().Be("2");
+        hdus[1].Header["XTENSION"].Should().Be("IMAGE");
+    }
+
+    [Test]
+    public void Reads_the_real_phd2_dark_library_if_present()
+    {
+        const string path = "/src/../phd2-dark-sample/PHD2_dark_lib_2.fit";
+        var candidates = new[] { path, Environment.GetEnvironmentVariable("PHD2_DARK_LIB") ?? string.Empty }.Where(File.Exists).ToList();
+        if (candidates.Count == 0)
+        {
+            Assert.Ignore("no PHD2 dark library sample available");
+        }
+
+        var hdus = FitsReader.ReadAll(File.ReadAllBytes(candidates[0]));
+        hdus.Should().HaveCount(8);
+        hdus.Should().OnlyContain(h => h.Frame.Width == 1280 && h.Frame.Height == 960);
+        hdus.Select(h => h.Header["EXPOSURE"]).Should().Contain("2.");
+    }
+
+    [Test]
     public void Rejects_truncated_data()
     {
         var bytes = Fits(16, 100, 100, (_, _) => 1);

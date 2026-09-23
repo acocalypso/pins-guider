@@ -60,6 +60,9 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
     private AdvancedGuiderAlert? lastError;
     private IProgress<ApplicationStatus>? progress;
     private TaskCompletionSource<bool>? autoSelectTcs;
+    private ICameraSource? cameraSource;
+    private string darkLibrary = string.Empty;
+    private volatile bool buildingDarks;
 
     public NativeGuider(IProfileService profileService, ITelescopeMediator telescopeMediator, ICameraMediator cameraMediator, Guid pluginId)
     {
@@ -196,7 +199,9 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
         var g = new Guider(camera, output, mountState, SystemClock.Instance, settings);
         g.EventRaised += OnEngineEvent;
         guider = g;
+        cameraSource = camera;
         PixelScale = g.PixelScale;
+        LoadDarks();
 
         if (options.ReuseCalibration && LoadStoredCalibration() is { } cal)
         {
@@ -239,6 +244,8 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
 
         simulator = null;
         mountState = null;
+        cameraSource = null;
+        darkLibrary = string.Empty;
         autoSelectTcs?.TrySetResult(false);
     }
 
@@ -297,6 +304,12 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
         if (g is null || !Connected)
         {
             Notification.ShowError("Native guider is not connected");
+            return false;
+        }
+
+        if (buildingDarks)
+        {
+            Notification.ShowError("Native guider: a dark library is being built — wait until it finishes");
             return false;
         }
 
@@ -427,6 +440,7 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
                 SessionStats = stats is null ? null : ToDto(stats.Session, stats),
                 LastError = lastError,
                 SettleStatus = settleStatus,
+                DarkLibrary = darkLibrary,
             };
         }
     }
@@ -512,6 +526,10 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
 
         var def = NativeGuiderOptions.Find(name);
         ApplySettingsIfConnected();
+        if (def?.Name is "UseDarkLibrary" or "Binning")
+        {
+            LoadDarks();
+        }
         if (def?.RequiresReconnect == true && Connected)
         {
             error = "saved; reconnect the guider to apply";
@@ -574,6 +592,107 @@ public sealed class NativeGuider : BaseINPC, IAdvancedGuider
     }
 
     public Task<bool> DitherBy(double pixels, bool raOnly, CancellationToken ct) => DitherCoreAsync(pixels, raOnly, null, ct);
+
+    /// <summary>PHD2's standard dark exposure steps (seconds).</summary>
+    private static readonly double[] DarkExposures = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5, 6, 7, 8, 9, 10, 15, 20, 30];
+
+    public async Task<bool> BuildDarkLibrary(double minExposureSeconds, double maxExposureSeconds, int framesPerExposure, CancellationToken ct)
+    {
+        var g = guider;
+        var cam = cameraSource;
+        if (g is null || cam is null || simulator is not null)
+        {
+            return false;
+        }
+
+        if (g.State.IsCapturing() || buildingDarks)
+        {
+            Notification.ShowError("Native guider: stop guiding/looping before building a dark library");
+            return false;
+        }
+
+        var exposures = DarkExposures.Where(e => e >= minExposureSeconds - 1e-9 && e <= maxExposureSeconds + 1e-9).ToList();
+        if (exposures.Count == 0)
+        {
+            exposures.Add(Math.Max(0.01, minExposureSeconds));
+        }
+
+        framesPerExposure = Math.Clamp(framesPerExposure, 1, 50);
+        buildingDarks = true;
+        int total = exposures.Count * framesPerExposure;
+        int index = 0;
+        try
+        {
+            var s = g.Settings;
+            var masters = new List<GuideFrame>();
+            foreach (var e in exposures)
+            {
+                var builder = new Engine.Imaging.MasterDarkBuilder();
+                for (int i = 0; i < framesPerExposure; i++)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    Raise("darks", DateTimeOffset.UtcNow, new { status = "capturing", exposure = e, frame = i + 1, framesPerExposure, index = ++index, total });
+                    var frame = await cam.CaptureAsync(new CaptureRequest(e * 1000.0, s.Binning, default, s.Gain, s.Offset), ct).ConfigureAwait(false);
+                    builder.Add(frame);
+                }
+
+                var master = builder.Build();
+                master.ExposureMs = e * 1000.0;
+                master.Binning = s.Binning;
+                masters.Add(master);
+            }
+
+            var path = DarkLibraryFiles.NativePath(cam.Name, cam.SensorWidth, cam.SensorHeight, s.Binning);
+            DarkLibraryFiles.Save(path, masters, s.Gain);
+            LoadDarks();
+            Raise("darks", DateTimeOffset.UtcNow, new { status = "done", total, message = darkLibrary });
+            Notification.ShowSuccess($"Native guider: dark library built ({masters.Count} exposures)");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            Raise("darks", DateTimeOffset.UtcNow, new { status = "failed", message = ex.Message });
+            Notification.ShowError($"Native guider: dark library failed — {ex.Message}");
+            return false;
+        }
+        finally
+        {
+            buildingDarks = false;
+        }
+    }
+
+    private void LoadDarks()
+    {
+        var g = guider;
+        var cam = cameraSource;
+        if (g is null || cam is null)
+        {
+            return;
+        }
+
+        if (!options.UseDarkLibrary || simulator is not null)
+        {
+            g.Preprocessor.Darks = null;
+            darkLibrary = string.Empty;
+            return;
+        }
+
+        try
+        {
+            var loaded = DarkLibraryFiles.Load(cam.Name, cam.SensorWidth, cam.SensorHeight, g.Settings.Binning);
+            g.Preprocessor.Darks = loaded?.Library;
+            darkLibrary = loaded is { } l ? $"{Path.GetFileName(l.Source)} ({l.Library.Count} darks)" : string.Empty;
+            if (loaded is null)
+            {
+                Logger.Info("NativeGuider: no dark library found for the guide camera");
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning($"NativeGuider: dark library not loaded: {ex.Message}");
+        }
+    }
 
     #endregion
 

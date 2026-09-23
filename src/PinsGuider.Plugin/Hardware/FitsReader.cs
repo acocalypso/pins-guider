@@ -25,8 +25,82 @@ internal static class FitsReader
             data = Decompress(data);
         }
 
-        var header = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         int offset = 0;
+        return ReadHdu(data, ref offset, out _) ?? throw new InvalidDataException("FITS primary HDU has no image");
+    }
+
+    /// <summary>Reads every image HDU (primary and IMAGE extensions) with its header keywords.</summary>
+    public static IReadOnlyList<(GuideFrame Frame, IReadOnlyDictionary<string, string> Header)> ReadAll(byte[] data)
+    {
+        var result = new List<(GuideFrame, IReadOnlyDictionary<string, string>)>();
+        int offset = 0;
+        while (offset + BlockSize <= data.Length)
+        {
+            var frame = ReadHdu(data, ref offset, out var header);
+            if (frame is not null)
+            {
+                result.Add((frame, header));
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>Writes frames as a multi-HDU 16-bit FITS file (primary + IMAGE extensions) with extra keywords per HDU.</summary>
+    public static void Write(Stream stream, IReadOnlyList<(GuideFrame Frame, IReadOnlyDictionary<string, string> Keywords)> hdus)
+    {
+        for (int h = 0; h < hdus.Count; h++)
+        {
+            var (f, kw) = hdus[h];
+            var cards = new List<string>
+            {
+                h == 0 ? Card("SIMPLE", "T") : Card("XTENSION", "'IMAGE   '"),
+                Card("BITPIX", "16"),
+                Card("NAXIS", "2"),
+                Card("NAXIS1", f.Width.ToString(CultureInfo.InvariantCulture)),
+                Card("NAXIS2", f.Height.ToString(CultureInfo.InvariantCulture)),
+            };
+            if (h > 0)
+            {
+                cards.Add(Card("PCOUNT", "0"));
+                cards.Add(Card("GCOUNT", "1"));
+            }
+            else
+            {
+                cards.Add(Card("EXTEND", "T"));
+            }
+
+            cards.Add(Card("BZERO", "32768"));
+            cards.Add(Card("BSCALE", "1"));
+            foreach (var (k, v) in kw)
+            {
+                cards.Add(Card(k, v));
+            }
+
+            cards.Add("END".PadRight(CardSize));
+            var header = string.Concat(cards);
+            header = header.PadRight((header.Length + BlockSize - 1) / BlockSize * BlockSize);
+            stream.Write(System.Text.Encoding.ASCII.GetBytes(header));
+
+            int n = f.Width * f.Height;
+            int padded = (n * 2 + BlockSize - 1) / BlockSize * BlockSize;
+            var buf = new byte[padded];
+            for (int i = 0; i < n; i++)
+            {
+                BinaryPrimitives.WriteInt16BigEndian(buf.AsSpan(i * 2, 2), (short)(f.Pixels[i] - 32768));
+            }
+
+            stream.Write(buf);
+        }
+    }
+
+    private static string Card(string key, string value) =>
+        (value.StartsWith('\'') ? $"{key,-8}= {value}" : $"{key,-8}= {value,20}").PadRight(CardSize);
+
+    private static GuideFrame? ReadHdu(byte[] data, ref int offset, out IReadOnlyDictionary<string, string> headerOut)
+    {
+        var header = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        headerOut = header;
         bool end = false;
         while (!end)
         {
@@ -63,9 +137,21 @@ internal static class FitsReader
 
         int bitpix = Int(header, "BITPIX");
         int naxis = Int(header, "NAXIS");
+        long dataBytes = 0;
+        if (naxis > 0)
+        {
+            dataBytes = Math.Abs(bitpix) / 8;
+            for (int a = 1; a <= naxis; a++)
+            {
+                dataBytes *= Int(header, "NAXIS" + a.ToString(CultureInfo.InvariantCulture));
+            }
+        }
+
+        int dataStart = offset;
+        offset += (int)((dataBytes + BlockSize - 1) / BlockSize * BlockSize);
         if (naxis < 2)
         {
-            throw new InvalidDataException($"FITS NAXIS={naxis} not supported");
+            return null;
         }
 
         int width = Int(header, "NAXIS1");
@@ -74,13 +160,13 @@ internal static class FitsReader
         double bscale = Dbl(header, "BSCALE", 1);
         int n = checked(width * height);
         int bytesPer = Math.Abs(bitpix) / 8;
-        if (offset + (long)n * bytesPer > data.Length)
+        if (dataStart + (long)n * bytesPer > data.Length)
         {
             throw new InvalidDataException("FITS data truncated");
         }
 
         var pixels = new ushort[n];
-        var src = data.AsSpan(offset);
+        var src = data.AsSpan(dataStart);
         switch (bitpix)
         {
             case 8:
