@@ -140,6 +140,47 @@ public class CoachSettingsAndHintsTests
         raised.Should().NotContain(h => h.Code == CoachCodes.HintRaOscillation || h.Code == CoachCodes.HintRaSluggish);
     }
 
+    [Test]
+    public void Report_store_round_trips_json_without_samples()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "coach-store-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var store = new FileCoachReportStore(dir);
+            var report = new CoachReport
+            {
+                Id = "20260923-220000-abc",
+                Timestamp = T0.UtcDateTime,
+                ProfileName = "P",
+                Drift = new CoachDrift { Samples = [new CoachSample(0, 0, 0), new CoachSample(2, 0.1, -0.1)], SeeingTotalArcsec = 0.5 },
+                Findings =
+                [
+                    CoachFindings.Create(CoachCodes.DriftPolarAlignment, CoachStepNames.Drift, CoachSeverities.Warning, T0.UtcDateTime,
+                        new() { ["arcmin"] = 7.5, ["decAssumed"] = false, ["driftArcsecPerMin"] = 1.0 }),
+                    CoachFindings.Create(CoachCodes.DriftPeriodicError, CoachStepNames.Drift, CoachSeverities.Info, T0.UtcDateTime,
+                        new() { ["amplitudeArcsec"] = 2.0, ["periodSeconds"] = null, ["maxRateArcsecPerSec"] = 0.03 }),
+                ],
+            };
+            store.Save(report);
+            store.Save(report with { Findings = report.Findings.Select(f => f with { Applied = true }).ToList() });
+
+            var loaded = store.Load(10).Should().ContainSingle().Subject;
+            loaded.Drift!.Samples.Should().BeEmpty();
+            loaded.Drift.SeeingTotalArcsec.Should().Be(0.5);
+            loaded.Findings.Should().OnlyContain(f => f.Applied);
+            loaded.Findings[0].Parameters["arcmin"].Should().Be(7.5);
+            loaded.Findings[0].Parameters["decAssumed"].Should().Be(false);
+            loaded.Findings[1].Parameters["periodSeconds"].Should().BeNull();
+        }
+        finally
+        {
+            if (Directory.Exists(dir))
+            {
+                Directory.Delete(dir, true);
+            }
+        }
+    }
+
     private static LiveHintInput Input(DateTimeOffset t, GuidingStatsSnapshot stats, GuiderSettings s, int decMs = 0, GuideDirection? decDir = null,
         bool decLimited = false, double snr = 40) => new()
     {

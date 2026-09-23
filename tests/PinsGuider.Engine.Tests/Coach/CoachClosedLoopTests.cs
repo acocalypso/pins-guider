@@ -325,6 +325,108 @@ public class CoachClosedLoopTests
         h.Coach.Status.GainMax.Should().Be(100, "the gain range is always reported");
     }
 
+    [Test]
+    public async Task Skip_keeps_partial_drift_results_and_continues()
+    {
+        var h = new Harness(SimulatorScenario.GoodMount);
+        bool skipped = false;
+        h.OnEvent = e =>
+        {
+            if (!skipped && e is CoachStatusEvent { Status: { Step: CoachStepNames.Drift, Drift.ElapsedSeconds: > 60 } })
+            {
+                skipped = true;
+                h.Coach.SkipStep().Should().BeTrue();
+            }
+        };
+        var status = await h.RunFromGuiding(new CoachOptions { Steps = [CoachStepNames.Drift, CoachStepNames.MountResponse], DriftSeconds = 600 });
+
+        status.Phase.Should().Be(CoachPhases.Complete);
+        status.Steps.Single(s => s.Name == CoachStepNames.Drift).State.Should().Be(CoachStepStates.Skipped);
+        status.Drift!.ElapsedSeconds.Should().BeLessThan(200, "the drift step ended early");
+        status.Drift.SeeingTotalArcsec.Should().NotBeNull("partial results are kept");
+        status.Findings.Should().Contain(f => f.Code == CoachCodes.DriftSeeing);
+        status.Steps.Single(s => s.Name == CoachStepNames.MountResponse).State.Should().Be(CoachStepStates.Done);
+        h.AssertRestoredAndGuiding();
+    }
+
+    [Test]
+    public async Task Mount_slew_interrupts_the_session()
+    {
+        var h = new Harness(SimulatorScenario.GoodMount);
+        bool slewed = false;
+        h.OnEvent = e =>
+        {
+            if (!slewed && e is CoachStatusEvent { Status: { Step: CoachStepNames.Drift, Drift.ElapsedSeconds: > 20 } })
+            {
+                slewed = true;
+                h.Sim.Mount.StartSlew(new SkyOffset(0, 0), TimeSpan.FromSeconds(8));
+            }
+        };
+        var status = await h.RunFromGuiding(new CoachOptions { Steps = [CoachStepNames.Drift] });
+
+        status.Phase.Should().Be(CoachPhases.Cancelled);
+        status.MessageCode.Should().Be(CoachCodes.Interrupted);
+        status.MessageParameters["reason"].Should().Be(CoachInterruptReasons.Slew);
+        h.Events.OfType<PausedEvent>().Should().ContainSingle(p => p.Reason == "Slewing", "the guider's own auto-pause takes over");
+        h.AssertRestoredAndGuiding();
+    }
+
+    [Test]
+    public async Task A_mount_failure_during_a_trial_fails_only_that_trial()
+    {
+        var scenario = SimulatorScenario.GoodMount with { Mount = SimulatorScenario.GoodMount.Mount with { RaDriftArcsecPerMin = 20 } };
+        var h = new Harness(scenario);
+        h.OnEvent = e =>
+        {
+            if (e is CoachStatusEvent { Status.Trials: { Count: > 0 } trials })
+            {
+                // the mount ignores pulses while trial A guides, and responds again for A2
+                h.Sim.Mount.NotResponding = trials[0].State == CoachTrialStates.Running;
+            }
+        };
+        var status = await h.RunFromGuiding(new CoachOptions { Steps = [CoachStepNames.Trials], TrialSeconds = 120 });
+
+        foreach (var t in status.Trials)
+        {
+            TestContext.Out.WriteLine($"trial {t.Id} {t.State} {t.RmsTotalArcsec}″ frames {t.Frames}");
+        }
+
+        status.Phase.Should().Be(CoachPhases.Complete);
+        status.Trials.Single(t => t.Id == CoachTrialIds.A).State.Should().Be(CoachTrialStates.Failed);
+        status.Trials.Single(t => t.Id == CoachTrialIds.A2).State.Should().Be(CoachTrialStates.Done);
+        h.Events.OfType<AlertEvent>().Should().Contain(a => a.Code == GuideErrorCode.MountNotResponding || a.Code == GuideErrorCode.RunawayDetected);
+        h.AssertRestoredAndGuiding();
+    }
+
+    [Test]
+    public async Task Live_hints_are_raised_while_guiding_normally()
+    {
+        // a strong one-sided Dec drift: every Dec correction goes the same way
+        var scenario = SimulatorScenario.GoodMount with { Mount = SimulatorScenario.GoodMount.Mount with { DecDriftArcsecPerMin = 4 } };
+        var h = new Harness(scenario);
+        var hints = new List<CoachHintEvent>();
+        h.OnEvent = e =>
+        {
+            if (e is CoachHintEvent hint)
+            {
+                lock (hints)
+                {
+                    hints.Add(hint);
+                }
+            }
+        };
+        _ = h.Guider.StartGuidingAsync(Settle);
+        h.Guider.StartLooping(h.Clock.CancelAt(TimeSpan.FromMinutes(12)));
+        await h.Guider.WaitForLoopAsync();
+
+        var dec = hints.Select(x => x.Hint).Where(x => x.Code == CoachCodes.HintDecDrift).ToList();
+        dec.Should().ContainSingle("the hint is rate limited to once per 10 minutes");
+        dec[0].Step.Should().Be(CoachStepNames.Live);
+        dec[0].Changes.Should().ContainSingle(c => c.Name == CoachSettingNames.DecGuideMode);
+        h.Guider.DismissHint(dec[0].Id).Should().BeTrue();
+        h.Guider.ActiveHints.Should().NotContain(x => x.Id == dec[0].Id);
+    }
+
     /// <summary>Wires simulator, guider, coach and an event recorder; runs sessions in virtual time.</summary>
     private sealed class Harness
     {
