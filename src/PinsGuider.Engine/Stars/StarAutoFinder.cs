@@ -131,29 +131,51 @@ internal static class StarAutoFinder
 
         // find each local maximum
         const int srch = 4;
-        for (int y = convRect.Top + srch; y <= convRect.Bottom - srch; y++)
+        // A pixel is a local maximum when no pixel of its 9x9 window is greater, i.e. when it equals the
+        // window maximum. The row-wise 9-pixel maxima are precomputed (in parallel); the candidate scan
+        // below keeps PHD2's row-major order, which matters for the top-N set.
+        var hmax = RowMax(conv, dw, convRect, srch);
+
+        // Candidate detection is independent per pixel and runs in parallel per row; the insertion into
+        // the top-N set below happens sequentially in PHD2's row-major order.
+        int yFirst = convRect.Top + srch, yLast = convRect.Bottom - srch;
+        var rowPeaks = new List<Peak>?[Math.Max(0, yLast - yFirst + 1)];
+        double gStdev = globalStdev;
+        int ds = downsample;
+        Parallel.For(yFirst, yLast + 1, y =>
         {
+            List<Peak>? list = null;
             for (int x = convRect.Left + srch; x <= convRect.Right - srch; x++)
             {
                 float val = conv[dw * y + x];
-                if (!(val > 0.0f) || !IsLocalMax(conv, dw, x, y, val, srch))
+                if (!(val > 0.0f) || !IsLocalMax(hmax, dw, x, y, val, srch))
                     continue;
 
                 // compare local maximum to mean value of surrounding pixels
                 const int local = 7;
                 var localRect = new IntRect(x - local, y - local, 2 * local + 1, 2 * local + 1).Intersect(convRect);
-                GetStats(out double localMean, out _, conv, dw, localRect);
+                double localMean = GetMean(conv, dw, localRect);
 
                 // this is our measure of star intensity
-                double hh = (val - localMean) / globalStdev;
+                double hh = (val - localMean) / gStdev;
                 if (hh < Threshold)
                     continue;
 
                 // coordinates on the original image
-                int imgx = x * downsample + downsample / 2;
-                int imgy = y * downsample + downsample / 2;
+                int imgx = x * ds + ds / 2;
+                int imgy = y * ds + ds / 2;
+                (list ??= new List<Peak>()).Add(new Peak(imgx, imgy, (float)hh));
+            }
 
-                SetInsert(stars, new Peak(imgx, imgy, (float)hh));
+            rowPeaks[y - yFirst] = list;
+        });
+
+        foreach (var list in rowPeaks)
+        {
+            if (list is null) continue;
+            foreach (var p in list)
+            {
+                SetInsert(stars, p);
                 if (stars.Count > TopN)
                     stars.RemoveAt(0);
             }
@@ -489,20 +511,58 @@ internal static class StarAutoFinder
         set.Insert(lo, p);
     }
 
-    private static bool IsLocalMax(float[] conv, int dw, int x, int y, float val, int srch)
+    // hmax[y*dw + x] = max(conv[y, x-srch .. x+srch]) for the rows of convRect and the candidate columns
+    private static float[] RowMax(float[] conv, int dw, IntRect convRect, int srch)
+    {
+        var hmax = new float[conv.Length];
+        int x0 = convRect.Left + srch, x1 = convRect.Right - srch;
+        if (x1 < x0)
+            return hmax;
+        Parallel.For(convRect.Top, convRect.Bottom + 1, y =>
+        {
+            int row = y * dw;
+            for (int x = x0; x <= x1; x++)
+            {
+                float m = conv[row + x - srch];
+                for (int i = -srch + 1; i <= srch; i++)
+                {
+                    float v = conv[row + x + i];
+                    if (v > m) m = v;
+                }
+
+                hmax[row + x] = m;
+            }
+        });
+        return hmax;
+    }
+
+    // true when no pixel in the (2*srch+1)^2 window is greater than val (val itself is part of the window)
+    private static bool IsLocalMax(float[] hmax, int dw, int x, int y, float val, int srch)
     {
         for (int j = -srch; j <= srch; j++)
         {
-            int row = dw * (y + j) + x;
-            for (int i = -srch; i <= srch; i++)
-            {
-                if (i == 0 && j == 0) continue;
-                if (conv[row + i] > val)
-                    return false;
-            }
+            if (hmax[dw * (y + j) + x] > val)
+                return false;
         }
 
         return true;
+    }
+
+    // The mean part of GetStats: PHD2 computes mean = sum / count with the same row-major double
+    // accumulation, so skipping the (unused) Welford variance gives a bit-identical mean.
+    private static double GetMean(float[] img, int width, IntRect win)
+    {
+        double sum = 0.0;
+        int p0 = win.Top * width + win.Left;
+        for (int y = 0; y < win.Height; y++)
+        {
+            int end = p0 + win.Width;
+            for (int p = p0; p < end; p++)
+                sum += img[p];
+            p0 += width;
+        }
+
+        return sum / ((double)win.Width * win.Height);
     }
 
     private static void GetStats(out double mean, out double stdev, float[] img, int width, IntRect win)
