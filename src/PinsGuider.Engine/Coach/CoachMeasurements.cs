@@ -141,7 +141,7 @@ public readonly record struct TrialSample(double T, double RaPx, double DecPx, d
 /// <summary>Statistics of a guided trial.</summary>
 /// <param name="RhoRa">Lag-1 autocorrelation of the RA errors (unclamped; likewise Dec).</param>
 /// <param name="EffectiveFrames">
-/// Effective number of independent frames: the smaller of the per-axis N·(1−ρ)/(1+ρ), ρ clamped to [0, 0.95]
+/// Effective number of independent frames: the smaller of the per-axis N·(1−ρ²)/(1+ρ²), ρ clamped to [0, 0.95]
 /// (see <see cref="TrialJudge.EffectiveFrames"/>).
 /// </param>
 public sealed record TrialStatistics(int Frames, double RmsRaArcsec, double RmsDecArcsec, double RmsTotalArcsec, double PeakArcsec, double OscillationIndex,
@@ -233,11 +233,14 @@ public static class TrialJudge
         return den > 0 ? num / den : 0;
     }
 
-    /// <summary>Effective sample size N·(1−ρ)/(1+ρ) with ρ clamped to [0, 0.95].</summary>
+    /// <summary>
+    /// Effective sample size for a variance (RMS) estimate of an AR(1) series: N·(1−ρ²)/(1+ρ²), ρ clamped to [0, 0.95].
+    /// (The mean-based N·(1−ρ)/(1+ρ) would be too conservative for comparing RMS values.)
+    /// </summary>
     public static double EffectiveFrames(int frames, double rho)
     {
         double r = double.IsFinite(rho) ? Math.Clamp(rho, 0, MaxRho) : 0;
-        return frames * (1 - r) / (1 + r);
+        return frames * (1 - r * r) / (1 + r * r);
     }
 
     /// <summary>

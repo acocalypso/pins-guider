@@ -324,7 +324,7 @@ public class CoachAnalysisTests
         }
 
         TestContext.Out.WriteLine($"mean ρ {rhoSum / 200:F2}; false winners {winners}/200 (frame-count rule: {naiveWinners}/200)");
-        winners.Should().BeLessThanOrEqualTo(10, "equal trials must not produce a winner in at least 95 % of the seeds");
+        winners.Should().BeLessThanOrEqualTo(10, "equal trials must produce a winner in at most 5 % of the seeds");
         naiveWinners.Should().BeGreaterThan(winners, "ignoring the autocorrelation overstates the significance");
     }
 
@@ -357,16 +357,32 @@ public class CoachAnalysisTests
             }
         }
 
-        TestContext.Out.WriteLine($"30 % better trial won {wins}/200");
+        TestContext.Out.WriteLine($"30 % better trial won {wins}/200 (independent frames)");
         wins.Should().BeGreaterThanOrEqualTo(160);
+
+        // moderately correlated errors (ρ = 0.5, 120 frames): the improvement is still found in most runs (~90 %)
+        int correlatedWins = 0;
+        for (int seed = 0; seed < 200; seed++)
+        {
+            var rng = new Random(5000 + seed);
+            var a = Ar1Trial("A", CoachTrialKinds.Current, 120, 0.5, sigma: 0.5, rng);
+            var b = Ar1Trial("B", CoachTrialKinds.Suggestion, 120, 0.5, sigma: 0.35, rng);
+            if (TrialJudge.Judge([a.Trial, b.Trial], new Dictionary<string, double> { ["A"] = a.Stats.EffectiveFrames, ["B"] = b.Stats.EffectiveFrames }).Significant)
+            {
+                correlatedWins++;
+            }
+        }
+
+        TestContext.Out.WriteLine($"30 % better trial won {correlatedWins}/200 (ρ = 0.5, 120 frames)");
+        correlatedWins.Should().BeGreaterThanOrEqualTo(160);
     }
 
     [Test]
     public void Effective_frames_follow_the_lag_one_autocorrelation()
     {
-        TrialJudge.EffectiveFrames(100, 0.7).Should().BeApproximately(100 * 0.3 / 1.7, 1e-9);
+        TrialJudge.EffectiveFrames(100, 0.7).Should().BeApproximately(100 * 0.51 / 1.49, 1e-9);
         TrialJudge.EffectiveFrames(100, -0.4).Should().Be(100, "negative autocorrelation is clamped to 0");
-        TrialJudge.EffectiveFrames(100, 0.99).Should().BeApproximately(100 * 0.05 / 1.95, 1e-9, "clamped to 0.95");
+        TrialJudge.EffectiveFrames(100, 0.99).Should().BeApproximately(100 * (1 - 0.9025) / 1.9025, 1e-9, "clamped to 0.95");
         TrialJudge.LagOneAutocorrelation([1, -1, 1, -1, 1, -1]).Should().BeLessThan(-0.5);
         var rng = new Random(3);
         TrialJudge.LagOneAutocorrelation(Ar1(5000, 0.7, 1.0, rng)).Should().BeApproximately(0.7, 0.05);
