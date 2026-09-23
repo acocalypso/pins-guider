@@ -568,12 +568,17 @@ public sealed partial class Guider : IAsyncDisposable
 
     private async Task LoopAsync(CancellationToken ct)
     {
-        coachFailureHandled = false;
         try
         {
             while (!ct.IsCancellationRequested)
             {
                 DrainCommands();
+                lock (loopLock)
+                {
+                    // commands of a forced start were drained by this loop: no restart needed when it ends
+                    forcedRestart = false;
+                }
+
                 if (!state.IsCapturing())
                 {
                     break;
@@ -648,7 +653,7 @@ public sealed partial class Guider : IAsyncDisposable
             calibrationProcess = null;
             ClearRequests();
             CompletePending(SettleResult.Failed(state == GuiderState.Failed ? lastError?.Code ?? GuideErrorCode.Internal : GuideErrorCode.None, "guiding stopped"));
-            OnLoopEndedForCoach();
+            OnLoopEndedForCoach(ct.IsCancellationRequested);
             FlushEvents();
             Emit(new LoopingExposuresStoppedEvent(clock.UtcNow));
             DrainPublishedEvents();
@@ -1069,7 +1074,8 @@ public sealed partial class Guider : IAsyncDisposable
         bool raOnly = corrector.DecGuideMode == DecGuideMode.Off;
         bool measuring = IsCoachMeasuring;
 
-        // measurements track the primary alone (like PHD2's guiding assistant disables multi-star)
+        // coach measurements track the primary alone here; their multi-star combined position comes from the coach meter
+        // (PHD2's refinement gates are made for guiding near the lock position, not for unguided drift and test pulses)
         var ts = new TrackerState(IsGuiding: true, IsSettling: settle.IsActive, IsPaused: paused, RaOnly: raOnly, GuidingEnabled: !paused && !measuring);
         var r = tracker.ProcessFrame(frame, lockPosition, ts, now);
         if (transform is not { } t)

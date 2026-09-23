@@ -67,8 +67,10 @@ public static class CoachReportBuilder
     {
         var ts = input.Timestamp.UtcDateTime;
 
-        // guided RMS: best completed trial, else the guiding window before the session
-        var bestTrial = input.Trials.Where(t => t.State == CoachTrialStates.Done && t.RmsTotalArcsec is not null).OrderBy(t => t.RmsTotalArcsec).FirstOrDefault();
+        // guided RMS: the winning trial (the current settings unless an alternative was significantly better), else the best
+        // completed trial, else the guiding window before the session
+        var completed = input.Trials.Where(t => t.State == CoachTrialStates.Done && t.RmsTotalArcsec is not null).ToList();
+        var bestTrial = completed.FirstOrDefault(t => t.IsWinner) ?? completed.OrderBy(t => t.RmsTotalArcsec).FirstOrDefault();
         double? guided = null, guidedRa = null, guidedDec = null;
         string source = CoachGuidedSources.None;
         if (bestTrial is not null)
